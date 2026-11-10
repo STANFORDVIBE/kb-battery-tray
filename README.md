@@ -14,7 +14,7 @@
 
 Нужен [Rust](https://rustup.rs). `build.bat` соберёт и положит `KbBatteryTray.exe` рядом. Тесты: `cargo test`, превью иконки во всех размерах: `cargo test preview -- --ignored` (`preview.bmp`), проверка с живым донглом: `cargo test live -- --ignored --nocapture`.
 
-Новая версия: поднять `version` в `Cargo.toml` → `build.bat` → `scripts\sign-release.ps1` → тег `v<версия>` → релиз с файлами `KbBatteryTray.exe` и `KbBatteryTray.exe.sig` (именно так, их качает обновлялка). Закрытый ключ лежит в `%USERPROFILE%\.kbbatterytray\release.key` — только там, держи копию: без него обновления по кнопке не выпустить.
+Новая версия: поднять `version` в `Cargo.toml` → `build.bat` → `scripts\sign-release.ps1` → тег `v<версия>` → релиз с файлами `KbBatteryTray.exe` и `KbBatteryTray.exe.sig` (именно так, их качает обновлялка). Закрытый ключ лежит в `%USERPROFILE%\.kbbatterytray\release.key`, зашифрованный паролем (скрипт спрашивает его при подписи). Держи копию файла: без него и пароля обновления по кнопке не выпустить.
 
 ## Протокол
 
