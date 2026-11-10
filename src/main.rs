@@ -1,6 +1,6 @@
 // Иконка в трее с зарядом беспроводной клавиатуры на донгле CompX (VID 3554, PID FA09).
-// Протокол: интерфейс FF02, output-репорт 20 байт `13 05 00… сумма`, в ответ приходит
-// `13 0A 01 00 <вольты> <%> <состояние> … сумма`, последний байт — сумма первых 19.
+// Протокол: интерфейс FF02, output-репорт 20 байт `13 4A 00… сумма`, в ответ приходит
+// `13 4A 01 00 02 <%> <состояние> … сумма`, последний байт — сумма первых 19.
 // Чистый Win32 без рантаймов: скрытое окно + Shell_NotifyIcon, опрос раз в 30 с.
 #![windows_subsystem = "windows"]
 
@@ -16,6 +16,7 @@ use windows_sys::Win32::{
     System::Threading::{CreateEventW, CreateMutexW, ResetEvent, WaitForSingleObject},
     System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED},
     Networking::WinInet::DeleteUrlCacheEntryW,
+    Security::Cryptography::*,
     System::Com::Urlmon::URLDownloadToFileW,
     UI::Shell::*,
     UI::WindowsAndMessaging::*,
@@ -429,7 +430,10 @@ fn make_icon(pct: u8, charging: bool) -> HICON {
 }
 
 // ---------- обновление ----------
-// Только по кнопке в меню: смотрим последний релиз на GitHub, качаем exe, подменяем себя и перезапускаемся.
+// Только по кнопке в меню: смотрим последний релиз на GitHub, качаем exe и его подпись, подменяем себя и перезапускаемся.
+// Подпись (ECDSA P-256 + SHA-256) сверяем с вшитым открытым ключом: даже со взломанным GitHub чужой exe не встанет.
+// Закрытый ключ — только у автора (scripts/sign-release.ps1).
+const RELEASE_PUB: &[u8] = include_bytes!("../release.pub");
 // shortcut: качаем прямо в потоке окна — пару секунд иконка не реагирует; хватает, пока exe маленький.
 
 fn download(url: &str, to: &std::path::Path) -> bool {
@@ -482,6 +486,17 @@ fn install() -> Result<(), String> {
         let _ = std::fs::remove_file(&new);
         return Err("скачался не тот файл".into());
     }
+    let sig_file = exe.with_file_name("KbBatteryTray.new.exe.sig");
+    let signed = download(&format!("{url}.sig"), &sig_file)
+        && match (std::fs::read(&new), std::fs::read(&sig_file)) {
+            (Ok(data), Ok(sig)) => signature_ok(RELEASE_PUB, &data, &sig),
+            _ => false,
+        };
+    let _ = std::fs::remove_file(&sig_file);
+    if !signed {
+        let _ = std::fs::remove_file(&new);
+        return Err("подпись не сходится — это не официальная версия, ставить не буду".into());
+    }
     let _ = std::fs::remove_file(&old);
     std::fs::rename(&exe, &old).map_err(|e| e.to_string())?;
     if let Err(e) = std::fs::rename(&new, &exe) {
@@ -495,6 +510,27 @@ fn install() -> Result<(), String> {
     notify(NIM_DELETE);
     unsafe { PostQuitMessage(0) };
     Ok(())
+}
+
+fn signature_ok(pubkey: &[u8], data: &[u8], sig: &[u8]) -> bool {
+    unsafe {
+        let mut hash = [0u8; 32];
+        if BCryptHash(BCRYPT_SHA256_ALG_HANDLE, ptr::null(), 0, data.as_ptr(), data.len() as u32, hash.as_mut_ptr(), 32) != 0 {
+            return false;
+        }
+        let mut alg = ptr::null_mut();
+        if BCryptOpenAlgorithmProvider(&mut alg, BCRYPT_ECDSA_P256_ALGORITHM, ptr::null(), 0) != 0 {
+            return false;
+        }
+        let mut key = ptr::null_mut();
+        let mut ok = false;
+        if BCryptImportKeyPair(alg, ptr::null_mut(), BCRYPT_ECCPUBLIC_BLOB, &mut key, pubkey.as_ptr(), pubkey.len() as u32, 0) == 0 {
+            ok = BCryptVerifySignature(key, ptr::null(), hash.as_ptr(), 32, sig.as_ptr(), sig.len() as u32, 0) == 0;
+            BCryptDestroyKey(key);
+        }
+        BCryptCloseAlgorithmProvider(alg, 0);
+        ok
+    }
 }
 
 // Старый exe остаётся после обновления; удалить получится, когда прежняя копия закроется.
@@ -554,6 +590,22 @@ fn autorun_set(on: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn signature_check() {
+        // одноразовый тестовый ключ, подпись сделана .NET ECDsaCng — как в sign-release.ps1
+        let pubk = unhex("4543533120000000045c965b062a2ee5d043b343040748bbe0fa178354c354c19ed5e67e691fd7a2eceeb80dad190444672295719a10b33f928ae4a780e16430c5d4d252ece433cf");
+        let sig = unhex("3427ebe0cc59a334f43be37761254ed02b3abfa231795d0447f937a15df42dc584319dad480609779b913305791525e300ec7f514835d3b62372a6a2bde1eea8");
+        assert!(signature_ok(&pubk, b"KbBatteryTray test", &sig));
+        assert!(!signature_ok(&pubk, b"KbBatteryTray tesT", &sig)); // подменённый файл
+        assert!(!signature_ok(RELEASE_PUB, b"KbBatteryTray test", &sig)); // чужой ключ
+        assert!(!signature_ok(&pubk, b"KbBatteryTray test", &sig[..10])); // обрезанная подпись
+        assert_eq!(RELEASE_PUB.len(), 72);
+    }
 
     #[test]
     fn update_version_logic() {
