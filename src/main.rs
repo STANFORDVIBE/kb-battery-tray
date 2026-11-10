@@ -120,7 +120,7 @@ fn update() {
         let mut s = s.borrow_mut();
         match r {
             Some((0, _)) => {
-                // на проводе процент не приходит — рисуем полную жёлтую
+                // процент не пришёл — рисуем полную с молнией
                 let tip = "Клавиатура: заряжается".to_string();
                 set_icon(&mut s, make_icon(100, true));
                 s.tip = tip.clone();
@@ -336,38 +336,82 @@ fn parse(res: &[u8; 20]) -> Option<(u8, bool)> {
 
 // ---------- иконка ----------
 
-// Горизонтальная батарейка: голубой контур (у мышиной — белый, чтобы не путать), заливка по проценту.
-// Зелёная — норм, жёлтая — заряжается, красная — ≤20%. pct=0 — пустая.
-fn battery_pixels(s: i32, pct: u8, charging: bool) -> Vec<u32> {
-    const OUTLINE: u32 = 0xFF87_CEFA;
-    let fill = if charging { 0xFFFF_D700 } else if pct <= 20 { 0xFFFF_0000 } else { 0xFF32_CD32 };
-    let pen = (s / 16).max(1);
-    let h = s * 9 / 16;
-    let top = (s - h) / 2;
-    let body_w = s - s / 8;
+// Клавиатура: белый корпус, клавиши в шахматном порядке, пробел. Корпус заливается слева
+// направо по проценту: зелёный — норм, красный — ≤20%. Зарядка — молния поверх, как на телефонах.
+// Рисуем в координатах сетки 16×16 и масштабируем под размер иконки трея.
+fn icon_pixels(s: i32, pct: u8, charging: bool) -> Vec<u32> {
+    const WHITE: u32 = 0xFFFF_FFFF;
+    const DARK: u32 = 0xFF1E_1E1E;
+    let fill = if pct <= 20 { 0xFFFF_3B30 } else { 0xFF34_C759 };
+    let k = s as f32 / 16.0;
+    let at = |v: f32| (v * k).round() as i32;
+    let u = (k.round() as i32).max(1); // толщина линии и размер клавиши — целые, иначе на 20/24 px клавиши «пляшут»
     let mut px = vec![0u32; (s * s) as usize];
-    let mut rect = |x0: i32, y0: i32, w: i32, hh: i32, c: u32| {
-        for y in y0.max(0)..(y0 + hh).min(s) {
-            for x in x0.max(0)..(x0 + w).min(s) {
-                px[(y * s + x) as usize] = c;
+    // f(старый цвет) -> новый; прямоугольник в пикселях [x0, x1) × [y0, y1)
+    let paint = |px: &mut Vec<u32>, x0: i32, x1: i32, y0: i32, y1: i32, f: &dyn Fn(u32) -> u32| {
+        for y in y0.max(0)..y1.min(s) {
+            for x in x0.max(0)..x1.min(s) {
+                let i = (y * s + x) as usize;
+                px[i] = f(px[i]);
             }
         }
     };
-    rect(0, top, body_w, pen, OUTLINE); // корпус
-    rect(0, top + h - pen, body_w, pen, OUTLINE);
-    rect(0, top, pen, h, OUTLINE);
-    rect(body_w - pen, top, pen, h, OUTLINE);
-    rect(body_w, top + h / 4, s - body_w, h - h / 2, OUTLINE); // носик
-    let inner = body_w - 4 * pen;
-    let fw = if pct == 0 { 0 } else { ((inner * pct as i32 + 50) / 100).max(pen) };
-    rect(2 * pen, top + 2 * pen, fw, h - 4 * pen, fill);
+    let (l, r, t, b) = (0, s, at(3.0), at(12.0)); // корпус; углы срезаны — так он выглядит скруглённым
+    paint(&mut px, l + u, r - u, t, t + u, &|_| WHITE);
+    paint(&mut px, l + u, r - u, b - u, b, &|_| WHITE);
+    paint(&mut px, l, l + u, t + u, b - u, &|_| WHITE);
+    paint(&mut px, r - u, r, t + u, b - u, &|_| WHITE);
+    let inner = r - 2 * u;
+    let fw = if pct == 0 { 0 } else { ((inner * pct as i32 + 50) / 100).max(u) };
+    paint(&mut px, l + u, l + u + fw, t + u, b - u, &|_| fill);
+    // клавиши: тёмные на заливке, белые на пустом месте; на 24 px клавиши 2×2 слипаются — там по 1 px
+    let kp = ((k * 0.75).round() as i32).max(1);
+    let key = |px: &mut Vec<u32>, x: f32, y: f32, w: i32| {
+        paint(px, at(x), at(x) + w, at(y), at(y) + kp, &|c| if c == fill { DARK } else { WHITE });
+    };
+    for i in 0..6 {
+        key(&mut px, 2.0 + 2.0 * i as f32, 5.0, kp);
+        key(&mut px, 3.0 + 2.0 * i as f32, 7.0, kp);
+    }
+    key(&mut px, 4.0, 9.0, at(12.0) - at(4.0)); // пробел
+    if charging {
+        bolt(&mut px, s);
+    }
     px
+}
+
+// Белая молния с тёмной обводкой по центру иконки.
+fn bolt(px: &mut [u32], s: i32) {
+    const POLY: [(f32, f32); 6] = [(9.2, 2.2), (4.8, 8.8), (7.6, 8.8), (6.8, 13.8), (11.2, 7.2), (8.4, 7.2)];
+    let k = s as f32 / 16.0;
+    let inside = |x: i32, y: i32| {
+        let (fx, fy) = ((x as f32 + 0.5) / k, (y as f32 + 0.5) / k);
+        let mut c = false;
+        for i in 0..POLY.len() {
+            let ((x1, y1), (x2, y2)) = (POLY[i], POLY[(i + 1) % POLY.len()]);
+            if (y1 > fy) != (y2 > fy) && fx < x1 + (fy - y1) * (x2 - x1) / (y2 - y1) {
+                c = !c;
+            }
+        }
+        c
+    };
+    let pen = (s / 16).max(1);
+    for y in 0..s {
+        for x in 0..s {
+            let i = (y * s + x) as usize;
+            if inside(x, y) {
+                px[i] = 0xFFFF_FFFF;
+            } else if (-pen..=pen).any(|dy| (-pen..=pen).any(|dx| inside(x + dx, y + dy))) {
+                px[i] = 0xFF1E_1E1E;
+            }
+        }
+    }
 }
 
 fn make_icon(pct: u8, charging: bool) -> HICON {
     unsafe {
         let s = GetSystemMetrics(SM_CXSMICON).max(16);
-        let px = battery_pixels(s, pct, charging);
+        let px = icon_pixels(s, pct, charging);
         let mut bi: BITMAPINFO = mem::zeroed();
         bi.bmiHeader.biSize = mem::size_of::<BITMAPINFOHEADER>() as u32;
         bi.bmiHeader.biWidth = s;
@@ -452,6 +496,49 @@ mod tests {
         assert_eq!(parse(&hex("13 0A 01 00 04 05 64 01 00 00 00 00 00 00 00 00 00 00 00 00")), None);
     }
 
+    // Превью всех состояний на тёмном фоне трея: cargo test preview -- --ignored, смотреть preview.bmp
+    #[test]
+    #[ignore]
+    fn preview() {
+        let states = [(0, false), (15, false), (60, false), (100, false), (15, true), (60, true)];
+        let sizes = [16, 20, 24, 32];
+        let (cell, pad) = (128usize, 8usize);
+        let (w, h) = (states.len() * (cell + pad) + pad, sizes.len() * (cell + pad) + pad);
+        let mut img = vec![0x2020_20u32; w * h];
+        for (r, &s) in sizes.iter().enumerate() {
+            for (c, &(pct, ch)) in states.iter().enumerate() {
+                let px = icon_pixels(s, pct, ch);
+                for y in 0..cell {
+                    for x in 0..cell {
+                        let p = px[(y * s as usize / cell) * s as usize + x * s as usize / cell];
+                        if p >> 24 != 0 {
+                            img[(pad + r * (cell + pad) + y) * w + pad + c * (cell + pad) + x] = p & 0xFF_FFFF;
+                        }
+                    }
+                }
+            }
+        }
+        let row = (w * 3 + 3) & !3;
+        let mut f = Vec::new();
+        f.extend(b"BM");
+        f.extend(((54 + row * h) as u32).to_le_bytes());
+        f.extend([0u8; 4]);
+        f.extend(54u32.to_le_bytes());
+        f.extend(40u32.to_le_bytes());
+        f.extend((w as i32).to_le_bytes());
+        f.extend((-(h as i32)).to_le_bytes());
+        f.extend(1u16.to_le_bytes());
+        f.extend(24u16.to_le_bytes());
+        f.extend([0u8; 24]);
+        for y in 0..h {
+            for x in 0..w {
+                f.extend(&img[y * w + x].to_le_bytes()[..3]);
+            }
+            f.resize(f.len() + row - w * 3, 0);
+        }
+        std::fs::write("preview.bmp", f).unwrap();
+    }
+
     // с живым донглом: cargo test -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -463,7 +550,7 @@ mod tests {
 
     #[test]
     fn fill_grows_with_charge() {
-        let green = |pct| battery_pixels(16, pct, false).iter().filter(|&&c| c == 0xFF32_CD32).count();
+        let green = |pct| icon_pixels(16, pct, false).iter().filter(|&&c| c == 0xFF34_C759).count();
         assert_eq!(green(0), 0);
         assert!(green(30) < green(69) && green(69) < green(100));
     }
