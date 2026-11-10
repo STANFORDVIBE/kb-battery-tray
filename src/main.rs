@@ -338,7 +338,7 @@ fn parse(res: &[u8; 20]) -> Option<(u8, bool)> {
 
 // Клавиатура по пиксель-арту 16×16: белая плоская рамка, внутри клавиши и пробел.
 // Заряд показывают клавиши: слева направо загораются зелёным (≤20% — красным), остальные серые.
-// Зарядка — жёлтая молния поверх, как на телефонах.
+// Зарядка — маленькая жёлтая молния в правом верхнем углу.
 // shortcut: масштаб только целый (16→32), на 20/24 px рисунок 16 px по центру — мельче, зато чёткий.
 // Рамка 16×11 (y 3..13): два ряда клавиш 2×2 в шахматном порядке и ряд с пробелом: (x, y, ширина, высота).
 const KEYS: [(i32, i32, i32, i32); 11] = [
@@ -349,16 +349,21 @@ const KEYS: [(i32, i32, i32, i32); 11] = [
 const TOP: i32 = 3;
 const BOTTOM: i32 = 13;
 
+// Молния пиксель-артом 5×7.
+const BOLT: [&str; 7] = ["...##", "..##.", ".##..", "#####", "..##.", ".##..", "##..."];
+
 fn icon_pixels(s: i32, pct: u8, charging: bool) -> Vec<u32> {
     const WHITE: u32 = 0xFFFF_FFFF;
     const GREY: u32 = 0xFF6E_6E6E;
+    const YELLOW: u32 = 0xFFFF_D60A;
+    const DARK: u32 = 0xFF1E_1E1E;
     let lit = if pct <= 20 { 0xFFFF_3B30 } else { 0xFF34_C759 };
     let f = (s / 16).max(1);
     let o = (s - 16 * f) / 2;
     let mut px = vec![0u32; (s * s) as usize];
     let mut rect = |x: i32, y: i32, w: i32, h: i32, c: u32| {
-        for yy in o + y * f..o + (y + h) * f {
-            for xx in o + x * f..o + (x + w) * f {
+        for yy in (o + y * f).max(0)..(o + (y + h) * f).min(s) {
+            for xx in (o + x * f).max(0)..(o + (x + w) * f).min(s) {
                 px[(yy * s + xx) as usize] = c;
             }
         }
@@ -374,35 +379,22 @@ fn icon_pixels(s: i32, pct: u8, charging: bool) -> Vec<u32> {
         rect(x, y, w, h, if on { lit } else { GREY });
     }
     if charging {
-        bolt(&mut px, s, f, o);
+        let (bx, by) = (11, 0); // правый верхний угол, как бейдж — клавиши почти не закрывает
+        let inb = |x: i32, y: i32| {
+            (0..7).contains(&(y - by)) && (0..5).contains(&(x - bx))
+                && BOLT[(y - by) as usize].as_bytes()[(x - bx) as usize] == b'#'
+        };
+        for y in -1..17 {
+            for x in -1..17 {
+                if inb(x, y) {
+                    rect(x, y, 1, 1, YELLOW);
+                } else if [(0, -1), (0, 1), (-1, 0), (1, 0)].iter().any(|&(dx, dy)| inb(x + dx, y + dy)) {
+                    rect(x, y, 1, 1, DARK); // обводка, чтобы молния не сливалась с клавишами
+                }
+            }
+        }
     }
     px
-}
-
-// Жёлтая молния с тонкой тёмной обводкой по центру иконки.
-fn bolt(px: &mut [u32], s: i32, f: i32, o: i32) {
-    const POLY: [(f32, f32); 6] = [(9.2, 2.2), (4.8, 8.8), (7.6, 8.8), (6.8, 13.8), (11.2, 7.2), (8.4, 7.2)];
-    let inside = |x: i32, y: i32| {
-        let (fx, fy) = ((x - o) as f32 / f as f32 + 0.5 / f as f32, (y - o) as f32 / f as f32 + 0.5 / f as f32);
-        let mut c = false;
-        for i in 0..POLY.len() {
-            let ((x1, y1), (x2, y2)) = (POLY[i], POLY[(i + 1) % POLY.len()]);
-            if (y1 > fy) != (y2 > fy) && fx < x1 + (fy - y1) * (x2 - x1) / (y2 - y1) {
-                c = !c;
-            }
-        }
-        c
-    };
-    for y in 0..s {
-        for x in 0..s {
-            let i = (y * s + x) as usize;
-            if inside(x, y) {
-                px[i] = 0xFFFF_D60A;
-            } else if [(0, -1), (0, 1), (-1, 0), (1, 0)].iter().any(|&(dx, dy)| inside(x + dx, y + dy)) {
-                px[i] = 0xFF1E_1E1E; // тонкая обводка, чтобы молния не сливалась с клавишами
-            }
-        }
-    }
 }
 
 fn make_icon(pct: u8, charging: bool) -> HICON {
