@@ -15,6 +15,8 @@ use windows_sys::Win32::{
     System::Registry::*,
     System::Threading::{CreateEventW, CreateMutexW, ResetEvent, WaitForSingleObject},
     System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED},
+    Networking::WinInet::DeleteUrlCacheEntryW,
+    System::Com::Urlmon::URLDownloadToFileW,
     UI::Shell::*,
     UI::WindowsAndMessaging::*,
 };
@@ -23,6 +25,9 @@ const WM_TRAY: u32 = WM_APP + 1;
 const ID_REFRESH: usize = 1;
 const ID_AUTORUN: usize = 2;
 const ID_EXIT: usize = 3;
+const ID_UPDATE: usize = 4;
+const REPO: &str = "STANFORDVIBE/kb-battery-tray";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const APP: &str = "KbBatteryTray";
 
@@ -33,12 +38,13 @@ struct State {
     last_tip: Option<String>, // последний удачный ответ: спящая клавиатура заряд не отдаёт, держим старый
     good_path: Option<Vec<u16>>, // интерфейс, который уже ответил, чтобы не перебирать каждый раз
     taskbar_msg: u32,
+    mutex: HANDLE, // отпускаем перед перезапуском после обновления, иначе новая копия решит, что уже запущена
 }
 
 thread_local! {
     static ST: RefCell<State> = RefCell::new(State {
         hwnd: ptr::null_mut(), icon: ptr::null_mut(), tip: String::new(),
-        last_tip: None, good_path: None, taskbar_msg: 0,
+        last_tip: None, good_path: None, taskbar_msg: 0, mutex: ptr::null_mut(),
     });
 }
 
@@ -48,7 +54,7 @@ fn w(s: &str) -> Vec<u16> {
 
 fn main() {
     unsafe {
-        CreateMutexW(ptr::null(), 1, w("KbBatteryTray_single").as_ptr());
+        let mutex = CreateMutexW(ptr::null(), 1, w("KbBatteryTray_single").as_ptr());
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }
@@ -63,7 +69,8 @@ fn main() {
         let hwnd = CreateWindowExW(0, cls.as_ptr(), cls.as_ptr(), 0, 0, 0, 0, 0,
             ptr::null_mut(), ptr::null_mut(), hinst, ptr::null());
         let tb = RegisterWindowMessageW(w("TaskbarCreated").as_ptr());
-        ST.with(|s| { let mut s = s.borrow_mut(); s.hwnd = hwnd; s.taskbar_msg = tb; });
+        ST.with(|s| { let mut s = s.borrow_mut(); s.hwnd = hwnd; s.taskbar_msg = tb; s.mutex = mutex; });
+        remove_old_exe();
 
         update();
         notify(NIM_ADD);
@@ -80,7 +87,7 @@ fn main() {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let tb = ST.with(|s| s.borrow().taskbar_msg);
     match msg {
-        WM_TIMER => { update(); notify(NIM_MODIFY); }
+        WM_TIMER => { remove_old_exe(); update(); notify(NIM_MODIFY); }
         WM_TRAY => match lp as u32 {
             WM_LBUTTONUP => { update(); notify(NIM_MODIFY); }
             WM_RBUTTONUP => menu(hwnd),
@@ -97,6 +104,7 @@ unsafe fn menu(hwnd: HWND) {
     let auto = if autorun_get() { MF_CHECKED } else { MF_UNCHECKED };
     AppendMenuW(m, MF_STRING, ID_REFRESH, w("Обновить").as_ptr());
     AppendMenuW(m, MF_STRING | auto, ID_AUTORUN, w("Запускать с Windows").as_ptr());
+    AppendMenuW(m, MF_STRING, ID_UPDATE, w(&format!("Проверить обновления (v{VERSION})")).as_ptr());
     AppendMenuW(m, MF_SEPARATOR, 0, ptr::null());
     AppendMenuW(m, MF_STRING, ID_EXIT, w("Выход").as_ptr());
     let mut pt: POINT = mem::zeroed();
@@ -108,6 +116,7 @@ unsafe fn menu(hwnd: HWND) {
     match cmd as usize {
         ID_REFRESH => { update(); notify(NIM_MODIFY); }
         ID_AUTORUN => autorun_set(!autorun_get()),
+        ID_UPDATE => check_update(hwnd),
         ID_EXIT => { notify(NIM_DELETE); PostQuitMessage(0); }
         _ => {}
     }
@@ -419,6 +428,94 @@ fn make_icon(pct: u8, charging: bool) -> HICON {
     }
 }
 
+// ---------- обновление ----------
+// Только по кнопке в меню: смотрим последний релиз на GitHub, качаем exe, подменяем себя и перезапускаемся.
+// shortcut: качаем прямо в потоке окна — пару секунд иконка не реагирует; хватает, пока exe маленький.
+
+fn download(url: &str, to: &std::path::Path) -> bool {
+    let (u, f) = (w(url), w(&to.to_string_lossy()));
+    unsafe {
+        DeleteUrlCacheEntryW(u.as_ptr()); // иначе Windows может отдать старый ответ из кэша
+        URLDownloadToFileW(ptr::null_mut(), u.as_ptr(), f.as_ptr(), 0, ptr::null_mut()) == 0
+    }
+}
+
+fn message(hwnd: HWND, text: &str, flags: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
+    unsafe { MessageBoxW(hwnd, w(text).as_ptr(), w("Заряд клавиатуры").as_ptr(), flags) }
+}
+
+fn check_update(hwnd: HWND) {
+    let json = std::env::temp_dir().join("KbBatteryTray-latest.json");
+    let tag = download(&format!("https://api.github.com/repos/{REPO}/releases/latest"), &json)
+        .then(|| std::fs::read_to_string(&json).ok())
+        .flatten()
+        .and_then(|s| latest_tag(&s));
+    let _ = std::fs::remove_file(&json);
+    let Some(tag) = tag else {
+        message(hwnd, "Не получилось проверить обновления. Есть интернет?", MB_ICONWARNING);
+        return;
+    };
+    if !newer(&tag, VERSION) {
+        message(hwnd, &format!("Стоит последняя версия v{VERSION}."), MB_ICONINFORMATION);
+        return;
+    }
+    let ask = format!("Вышла новая версия {tag} (у тебя v{VERSION}). Обновить?");
+    if message(hwnd, &ask, MB_YESNO | MB_ICONQUESTION) == IDYES {
+        if let Err(e) = install() {
+            message(hwnd, &format!("Не получилось обновиться: {e}"), MB_ICONWARNING);
+        }
+    }
+}
+
+// Качает новый exe рядом, подменяет текущий (запущенный exe Windows переименовать даёт) и перезапускает.
+fn install() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let new = exe.with_file_name("KbBatteryTray.new.exe");
+    let old = exe.with_file_name("KbBatteryTray.old.exe");
+    let url = format!("https://github.com/{REPO}/releases/latest/download/KbBatteryTray.exe");
+    if !download(&url, &new) {
+        return Err("файл не скачался".into());
+    }
+    // вместо exe может прийти страница с ошибкой — проверяем, что это программа
+    let ok = std::fs::read(&new).map(|b| b.len() > 50_000 && b.starts_with(b"MZ")).unwrap_or(false);
+    if !ok {
+        let _ = std::fs::remove_file(&new);
+        return Err("скачался не тот файл".into());
+    }
+    let _ = std::fs::remove_file(&old);
+    std::fs::rename(&exe, &old).map_err(|e| e.to_string())?;
+    if let Err(e) = std::fs::rename(&new, &exe) {
+        let _ = std::fs::rename(&old, &exe); // вернуть как было
+        return Err(e.to_string());
+    }
+    ST.with(|s| unsafe { CloseHandle(s.borrow().mutex) });
+    if let Err(e) = std::process::Command::new(&exe).spawn() {
+        return Err(format!("новая версия не запустилась: {e}")); // exe уже новый — запустится при следующем старте
+    }
+    notify(NIM_DELETE);
+    unsafe { PostQuitMessage(0) };
+    Ok(())
+}
+
+// Старый exe остаётся после обновления; удалить получится, когда прежняя копия закроется.
+fn remove_old_exe() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::fs::remove_file(exe.with_file_name("KbBatteryTray.old.exe"));
+    }
+}
+
+fn latest_tag(json: &str) -> Option<String> {
+    let rest = &json[json.find("\"tag_name\"")? + 10..];
+    let rest = &rest[rest.find('"')? + 1..];
+    Some(rest[..rest.find('"')?].to_string())
+}
+
+// «v0.3.0» новее «0.2.1»?
+fn newer(tag: &str, current: &str) -> bool {
+    let parse = |v: &str| v.trim_start_matches('v').split('.').map(|p| p.parse().unwrap_or(0)).collect::<Vec<u32>>();
+    parse(tag) > parse(current)
+}
+
 // ---------- автозапуск ----------
 
 fn autorun_get() -> bool {
@@ -457,6 +554,17 @@ fn autorun_set(on: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_version_logic() {
+        let json = r#"{"url":"x","tag_name":"v0.3.0","name":"0.3.0"}"#;
+        assert_eq!(latest_tag(json).as_deref(), Some("v0.3.0"));
+        assert_eq!(latest_tag("{}"), None);
+        assert!(newer("v0.3.0", "0.2.0"));
+        assert!(newer("v0.10.0", "0.9.9"));
+        assert!(!newer("v0.2.0", "0.2.0"));
+        assert!(!newer("v0.1.5", "0.2.0"));
+    }
 
     fn hex(s: &str) -> [u8; 20] {
         let mut r = [0u8; 20];
