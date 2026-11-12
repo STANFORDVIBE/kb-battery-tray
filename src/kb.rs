@@ -33,7 +33,10 @@ const PALETTE_LEN: usize = 480; // драйвер пишет первые 480 б
 // палитра по умолчанию — если цвета не прочитались
 pub const PALETTE: [(u8, u8, u8); 7] = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255), (255, 255, 255)];
 
-const PACE_MS: u64 = 20; // между кадрами записи: проверено на живой клавиатуре, вся таблица уходит за ~0,3 с
+// Пауза между кадрами записи. Замерено на живой F75 через донгл: 5 мс — 5 из 5 записей доходят, 2 мс — теряются.
+// Таблица уходит за ~80 мс, палитры — за ~0,3 с. Если запись не дошла, повторяем медленно.
+const PACE_MS: u64 = 6;
+const SAFE_PACE_MS: u64 = 20;
 
 // Один разговор с донглом за раз: заряд (иконка) и настройки (панель) иначе перепутают ответы
 static HID_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -306,21 +309,35 @@ impl Dev {
         if t.len() < 100 || slot(t, 1).is_none() {
             return false; // не наша таблица — мусор в клавиатуру не пишем
         }
-        for f in table_frames(t) {
-            if !self.write(&f) {
-                return false;
+        self.send_checked(&table_frames(t), 0x44, |back| back == t)
+    }
+
+    // Отправить и перечитать; не сошлось — ещё раз с паузой побольше
+    fn send_checked(&self, frames: &[[u8; 20]], read_cmd: u8, same: impl Fn(&[u8]) -> bool) -> bool {
+        [PACE_MS, SAFE_PACE_MS].into_iter().any(|pace| {
+            self.send(frames, pace) && {
+                thread::sleep(Duration::from_millis(30));
+                self.read_multi(read_cmd).is_some_and(|back| same(&back))
             }
-            thread::sleep(Duration::from_millis(PACE_MS));
-        }
-        thread::sleep(Duration::from_millis(150));
-        self.read_multi(0x44).is_some_and(|back| back == t)
+        })
     }
 
     // Одна правка: свежая таблица из клавиатуры → правка → запись. Первая запись заодно сохраняет таблицу «как было»
     pub fn change(&self, c: Change) -> bool {
         let Some(mut t) = self.read_multi(0x44) else { return false };
         backup("backup.bin", &t);
-        apply(&mut t, c) && self.write_table(&t)
+        let before = t.clone();
+        apply(&mut t, c) && (t == before || self.write_table(&t)) // ничего не поменялось — не пишем
+    }
+
+    fn send(&self, frames: &[[u8; 20]], pace_ms: u64) -> bool {
+        frames.iter().all(|f| {
+            let ok = self.write(f);
+            if pace_ms > 0 {
+                thread::sleep(Duration::from_millis(pace_ms));
+            }
+            ok
+        })
     }
 
     // Записать палитры и перечитать: true — клавиатура запомнила ровно это
@@ -328,14 +345,7 @@ impl Dev {
         if p.len() < PALETTE_LEN {
             return false;
         }
-        for f in palette_frames(p) {
-            if !self.write(&f) {
-                return false;
-            }
-            thread::sleep(Duration::from_millis(PACE_MS));
-        }
-        thread::sleep(Duration::from_millis(150));
-        self.read_multi(0x49).is_some_and(|back| back.get(..PALETTE_LEN) == p.get(..PALETTE_LEN))
+        self.send_checked(&palette_frames(p), 0x49, |back| back.get(..PALETTE_LEN) == p.get(..PALETTE_LEN))
     }
 
     // Свой цвет эффекта: первым цветом его палитры, и эффект переключается на этот цвет — как в драйвере
@@ -586,29 +596,69 @@ mod tests {
         assert!(r.is_some());
     }
 
+    // Как быстро можно слать кадры: меняем невидимое (сон; палитру эффекта, который сейчас не горит), проверяем, возвращаем.
+    // cargo test pace_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn pace_live() {
+        with_dev(|d| {
+            let t0 = d.read_multi(0x44)?;
+            let p0 = d.read_multi(0x49)?;
+            let mode = u16::from_be_bytes([t0[9], t0[10]]);
+            let other = if mode == 2 { 4 } else { 2 } * 21; // палитра чужого эффекта
+            for pace in [10u64, 5, 2, 0] {
+                let (mut ok_t, mut ok_p, mut ms_t, mut ms_p) = (0, 0, 0u128, 0u128);
+                for round in 0..5u8 {
+                    let mut t = t0.clone();
+                    t[24] = [10, 20, 40, 0, 30][round as usize];
+                    let s = std::time::Instant::now();
+                    d.send(&table_frames(&t), pace);
+                    ms_t += s.elapsed().as_millis();
+                    thread::sleep(Duration::from_millis(30));
+                    ok_t += (d.read_multi(0x44).as_deref() == Some(&t[..])) as u32;
+                    let mut p = p0.clone();
+                    p[other] = round * 40 + 1;
+                    let s = std::time::Instant::now();
+                    d.send(&palette_frames(&p), pace);
+                    ms_p += s.elapsed().as_millis();
+                    thread::sleep(Duration::from_millis(30));
+                    ok_p += d.read_multi(0x49).is_some_and(|b| b[..PALETTE_LEN] == p[..PALETTE_LEN]) as u32;
+                }
+                println!("пауза {pace} мс: таблица {ok_t}/5 за ~{} мс, палитра {ok_p}/5 за ~{} мс", ms_t / 5, ms_p / 5);
+            }
+            let back = d.write_table(&t0) && d.write_palette(&p0);
+            println!("вернул как было: {back}");
+            Some(())
+        });
+    }
+
     // Запись на живой клавиатуре и возврат как было: cargo test write_live -- --ignored --nocapture
+    // На время теста сон «никогда» — иначе клавиатура засыпает посреди замеров
     #[test]
     #[ignore]
     fn write_live() {
         let ok = with_dev(|d| {
             let orig = d.read_multi(0x44)?;
-            let t = std::time::Instant::now();
-            let changed = d.change(Change::Sleep(if orig[24] == 10 { 20 } else { 10 }));
-            println!("правка дошла: {changed} за {:?}", t.elapsed());
-            let restored = d.write_table(&orig);
-            println!("вернул как было: {restored}");
-            // свой цвет: в палитру эффекта и обратно (сам эффект на палитре не переключаем — подсветка не мигнёт)
             let pal = d.read_multi(0x49)?;
+            let mut awake = orig.clone();
+            awake[24] = 0;
+            let mut ok = d.write_table(&awake);
             let mode = u16::from_be_bytes([orig[9], orig[10]]).max(1);
-            let at = mode as usize * 21;
-            let mut p = pal.clone();
-            p[at..at + 3].copy_from_slice(&[12, 34, 56]);
-            let t = std::time::Instant::now();
-            let colored = d.write_palette(&p);
-            println!("палитра дошла: {colored} за {:?}", t.elapsed());
-            let back = d.write_palette(&pal);
-            println!("палитру вернул: {back}");
-            Some(changed && restored && colored && back)
+            let other = if mode == 2 { 4 } else { 2 } as usize * 21; // палитра эффекта, который сейчас не горит
+            for round in 0..4u8 {
+                let t = std::time::Instant::now();
+                let changed = d.change(Change::Sleep([10, 20, 40, 0][round as usize]));
+                let t1 = t.elapsed();
+                let mut p = pal.clone();
+                p[other..other + 3].copy_from_slice(&[round * 50 + 1, 34, 56]);
+                let t = std::time::Instant::now();
+                let colored = d.write_palette(&p);
+                println!("правка: {changed} за {t1:?}, палитра: {colored} за {:?}", t.elapsed());
+                ok &= changed && colored;
+            }
+            let restored = d.write_table(&orig) && d.write_palette(&pal);
+            println!("вернул как было: {restored}");
+            Some(ok && restored)
         });
         assert_eq!(ok, Some(true));
     }

@@ -75,6 +75,8 @@ struct Panel {
     confirmed: Option<Config>, // что клавиатура сказала в последний раз — к этому откатываемся, если запись не дошла
     battery: Option<(u8, bool)>,
     last_mode: u16, // какой эффект включить кнопкой подсветки
+    drag: Option<Act>, // тянут полоску цвета (кнопка мыши зажата)
+    hs: ((u8, u8, u8), (f32, f32)), // последний свой цвет и его оттенок/насыщенность: у белого оттенок из RGB не восстановить
     status: Status,
     // интерфейс
     hits: Vec<(RectF, Act)>,
@@ -143,13 +145,21 @@ fn run(job: Option<Job>) {
 }
 
 fn worker(hwnd: isize, rx: mpsc::Receiver<(u64, Option<Job>)>) {
-    while let Some(first) = rx.recv().ok() { // не `Ok(..)`: имя Ok затенено константой из windows-sys
+    let mut carry = Vec::new();
+    loop {
         // накопившиеся клики применяем подряд, а перечитываем один раз в конце
-        let mut batch = vec![first];
+        let mut batch = mem::take(&mut carry);
+        if batch.is_empty() {
+            match rx.recv() {
+                Result::Ok(first) => batch.push(first), // не `Ok(..)`: имя Ok затенено константой из windows-sys
+                Result::Err(_) => return,
+            }
+        }
         batch.extend(rx.try_iter());
         let seq = batch.last().map_or(0, |b| b.0);
         let mut jobs: Vec<Job> = batch.into_iter().filter_map(|b| b.1).collect();
-        // палитра пишется ~1 с: из нескольких кликов по полоске важен только последний
+        let opening = jobs.is_empty();
+        // палитра пишется ~0,3 с: пока тянут полоску цвета, важен только последний цвет
         let last_rgb = jobs.iter().rposition(|j| matches!(j, Job::Rgb(..)));
         let mut i = 0;
         jobs.retain(|j| { i += 1; !matches!(j, Job::Rgb(..)) || Some(i - 1) == last_rgb });
@@ -185,10 +195,20 @@ fn worker(hwnd: isize, rx: mpsc::Receiver<(u64, Option<Job>)>) {
                         Job::Restore => { kb::restore_backup(d); }
                     }
                 }
+                // пока писали, пришли новые правки — сразу к ним, перечитаем после
+                if let Result::Ok(next) = rx.try_recv() {
+                    carry.push(next);
+                    return Some(());
+                }
                 out.cfg = Some(d.read_config()?);
-                out.battery = d.battery();
+                if opening {
+                    out.battery = d.battery(); // заряд — только при открытии, правки не задерживаем
+                }
                 Some(())
             });
+        }
+        if !carry.is_empty() {
+            continue;
         }
         *RESULT.lock().unwrap_or_else(|e| e.into_inner()) = Some(out);
         unsafe { PostMessageW(hwnd as HWND, WM_LOADED, 0, 0) };
@@ -232,7 +252,7 @@ pub fn init() {
         }
 
         let p = Panel {
-            hwnd, scale, cfg: None, confirmed: None, battery: None, last_mode: 1, status: Status::Loading,
+            hwnd, scale, cfg: None, confirmed: None, battery: None, last_mode: 1, drag: None, hs: ((0, 0, 0), (0.0, 0.0)), status: Status::Loading,
             hits: Vec::new(), hover: None, entered: false, visible: false, closing: false, progress: 0.0, anim_from: 0.0,
             anim_start: Instant::now(), hidden_at: None, anchor: POINT { x: 0, y: 0 }, panel_rc: mem::zeroed(),
             genie: true, slide: (0.0, 1.0), snap: Vec::new(), snap_w: 0, card: (0, 0, Vec::new()), fg_at_open: ptr::null_mut(),
@@ -452,6 +472,10 @@ impl Panel {
         if self.animating() {
             return;
         }
+        if self.drag.is_some() {
+            self.pick(self.logical(lp).0);
+            return;
+        }
         let h = self.hit(self.logical(lp));
         self.entered = true;
         unsafe {
@@ -467,29 +491,59 @@ impl Panel {
     }
 
     // Меняем на экране сразу, запись — в фоне; после записи клавиатура перечитывается и покажет правду
-    fn click(&mut self, lp: LPARAM) {
+    // Кнопка нажата на полоске цвета — цвет сразу, дальше он едет за мышью до отпускания
+    fn press(&mut self, lp: LPARAM) {
         if self.animating() {
             return;
         }
-        let (x, _) = self.logical(lp);
-        let Some(act) = self.hit(self.logical(lp)) else { return };
+        let pt = self.logical(lp);
+        let act = self.hit(pt);
+        if matches!(act, Some(Act::Hue | Act::Sat)) {
+            self.drag = act;
+            unsafe { SetCapture(self.hwnd) };
+            self.pick(pt.0);
+        }
+    }
+
+    // Оттенок и насыщенность своего цвета
+    fn cur_hs(&self, c: &Config) -> (f32, f32) {
+        if self.hs.0 == c.swatch(0) { self.hs.1 } else { kb::hue_sat(c.swatch(0)) }
+    }
+
+    fn pick(&mut self, x: f32) {
+        let Some(c) = self.cfg.as_ref() else { return };
+        let k = ((x - PAD) / (W - 2.0 * PAD)).clamp(0.0, 1.0);
+        let (h, s) = self.cur_hs(c);
+        let (h, s) = if self.drag == Some(Act::Hue) { (k, if s < 0.05 { 1.0 } else { s }) } else { (h, k) };
+        let rgb = kb::hsv(h, s);
+        self.hs = (rgb, (h, s));
         let Some(c) = self.cfg.as_mut() else { return };
-        if matches!(act, Act::Hue | Act::Sat) {
-            let k = ((x - PAD) / (W - 2.0 * PAD)).clamp(0.0, 1.0);
-            let (h, s) = kb::hue_sat(c.swatch(0));
-            let rgb = if act == Act::Hue { kb::hsv(k, if s < 0.05 { 1.0 } else { s }) } else { kb::hsv(h, k) };
-            let mode = c.mode();
-            // на экране — сразу: первый цвет палитры эффекта и выбор этого цвета
-            let at = mode as usize * 21;
-            if c.palette.len() < at + 3 {
-                c.palette = kb::PALETTE.iter().flat_map(|c| [c.0, c.1, c.2]).collect::<Vec<u8>>().repeat(24);
-            }
-            c.palette[at..at + 3].copy_from_slice(&[rgb.0, rgb.1, rgb.2]);
-            kb::apply(&mut c.table, Change::Color(0));
-            run(Some(Job::Rgb(mode, rgb)));
-            self.render();
+        let mode = c.mode();
+        if c.swatch(0) == rgb && c.color() == Some(0) {
+            self.render(); // тот же цвет — в клавиатуру не шлём
             return;
         }
+        // на экране — сразу: первый цвет палитры эффекта и выбор этого цвета
+        let at = mode as usize * 21;
+        if c.palette.len() < at + 3 {
+            c.palette = kb::PALETTE.iter().flat_map(|c| [c.0, c.1, c.2]).collect::<Vec<u8>>().repeat(24);
+        }
+        c.palette[at..at + 3].copy_from_slice(&[rgb.0, rgb.1, rgb.2]);
+        kb::apply(&mut c.table, Change::Color(0));
+        run(Some(Job::Rgb(mode, rgb)));
+        self.render();
+    }
+
+    fn click(&mut self, lp: LPARAM) {
+        if self.drag.take().is_some() {
+            unsafe { ReleaseCapture() };
+            return; // цвет уже выбран при нажатии и протяжке
+        }
+        if self.animating() {
+            return;
+        }
+        let Some(act) = self.hit(self.logical(lp)) else { return };
+        let Some(c) = self.cfg.as_mut() else { return };
         let change = match act {
             Act::Power if c.mode() == 0 => Change::Mode(self.last_mode),
             Act::Power => Change::Mode(0),
@@ -498,7 +552,7 @@ impl Panel {
             Act::Speed(v) => Change::Speed(v),
             Act::Color(v) => Change::Color(v),
             Act::Sleep(v) => Change::Sleep(v),
-            Act::Hue | Act::Sat => return,
+            Act::Hue | Act::Sat => return, // их ведёт press()
         };
         if !kb::apply(&mut c.table, change) {
             return;
@@ -768,7 +822,7 @@ impl Panel {
                 }
             }
             // свой цвет: оттенок и насыщенность; кладётся первым цветом палитры (первый кружок)
-            let (h, sat) = kb::hue_sat(c.swatch(0));
+            let (h, sat) = self.cur_hs(&c);
             let full = |(r, g, b): (u8, u8, u8)| 0xFF00_0000 | (r as u32) << 16 | (g as u32) << 8 | b as u32;
             let hue: Vec<u32> = (0..=6).map(|i| full(kb::hsv(i as f32 / 6.0, 1.0))).collect();
             let fade = [0xFFFF_FFFF, full(kb::hsv(h, 1.0))];
@@ -1095,7 +1149,7 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
         }),
         WM_MOUSEMOVE => with(|p| p.mouse_move(lp)),
         WM_MOUSELEAVE => with(|p| {
-            if p.entered && p.visible && !p.closing {
+            if p.entered && p.visible && !p.closing && p.drag.is_none() {
                 SetTimer(p.hwnd, T_LEAVE, 350, None); // мимолётный выход за край не считаем
             }
             if p.hover.is_some() {
@@ -1103,7 +1157,9 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 p.render();
             }
         }),
+        WM_LBUTTONDOWN => with(|p| p.press(lp)),
         WM_LBUTTONUP => with(|p| p.click(lp)),
+        WM_CAPTURECHANGED => with(|p| p.drag = None),
         WM_KEYDOWN if wp == VK_ESCAPE as usize => with(|p| p.close()),
         WM_ANIM => {
             anim_loop();
