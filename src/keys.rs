@@ -27,6 +27,7 @@ const H: f32 = FOOT + 120.0;
 const S: f32 = 16.0; // поле под тень
 const WM_KEYS_LOADED: u32 = WM_APP + 20;
 const WM_PICK_FILE: u32 = WM_APP + 21;
+const T_RETRY: usize = 1;
 
 const FN: usize = 53; // клавиша Fn: её не трогаем, иначе пропадёт Fn-слой
 
@@ -109,7 +110,7 @@ fn with<R>(f: impl FnOnce(&mut Win) -> R) -> Option<R> {
 // ───── фоновый поток: чтение и запись раскладки ─────
 enum Job {
     Load,
-    Write(u8, Vec<u32>),
+    Write(u8, usize, u32), // слой, позиция, новый код
     Restore,
 }
 
@@ -139,7 +140,7 @@ fn worker(rx: mpsc::Receiver<(u64, Job)>) {
             let mut f = FAKE.lock().unwrap_or_else(|e| e.into_inner());
             let k = f.get_or_insert_with(|| [sample(0), sample(1)]);
             match &job {
-                Job::Write(l, v) => k[*l as usize] = v.clone(),
+                Job::Write(l, i, v) => k[*l as usize][*i] = *v,
                 Job::Restore => if let Some(o) = kb::keys_backup() { *k = [o[0].clone(), o[1].clone()] },
                 Job::Load => {}
             }
@@ -148,8 +149,8 @@ fn worker(rx: mpsc::Receiver<(u64, Job)>) {
             kb::with_dev(|d| {
                 out.ok = match &job {
                     Job::Load => true,
-                    Job::Write(l, v) => d.write_keys(*l, v),
-                    Job::Restore => kb::keys_backup().is_some_and(|k| (0..3).all(|l| d.read_keys(l).as_ref() == Some(&k[l as usize]) || d.write_keys(l, &k[l as usize]))),
+                    Job::Write(l, i, v) => d.set_key(*l, *i, *v),
+                    Job::Restore => kb::restore_keys(d),
                 };
                 out.keys = Some([d.read_keys(0)?, d.read_keys(1)?]);
                 Some(())
@@ -213,12 +214,7 @@ pub fn open() {
 
 impl Win {
     fn close(&mut self) {
-        unsafe {
-            if !self.hook.is_null() {
-                UnhookWindowsHookEx(self.hook);
-            }
-            PostMessageW(self.hwnd, WM_CLOSE, 0, 0); // окно уничтожим вне этого вызова
-        }
+        unsafe { PostMessageW(self.hwnd, WM_CLOSE, 0, 0) }; // окно уничтожим вне этого вызова
     }
 
     fn cur(&self) -> Option<&Vec<u32>> {
@@ -318,9 +314,8 @@ impl Win {
             return;
         }
         k[i] = v;
-        let keys = k.clone();
         self.busy = true;
-        run(Job::Write(layer, keys));
+        run(Job::Write(layer, i, v));
         self.render();
     }
 
@@ -393,7 +388,7 @@ impl Win {
             });
             if self.keys.is_none() {
                 self.loaded = false;
-                run(Job::Load); // проснётся — покажем
+                unsafe { SetTimer(self.hwnd, T_RETRY, 2000, None) }; // проснётся — покажем; донгл между попытками свободен
             }
         }
         self.render();
@@ -445,13 +440,7 @@ impl Win {
         let mut hits = Vec::new();
         let hov = self.hover;
 
-        // карточка с тенью, как у панели
-        for i in (1..=S as i32).rev().step_by(2) {
-            let i = i as f32;
-            d.round(-i + 2.0, -i + 5.0, W + 2.0 * i - 4.0, H + 2.0 * i - 4.0, 14.0 + i, 0x0900_0000);
-        }
-        d.round(0.0, 0.0, W, H, 14.0, BG);
-        d.round_outline(0.0, 0.0, W, H, 14.0, 0x1CFF_FFFF);
+        panel::draw_card(&d, W, H);
 
         // шапка: название, слои, закрыть
         d.text("Клавиши AULA F75", 18.0, true, FG, rf(PAD, 16.0, 300.0, 26.0), Align::Left);
@@ -844,16 +833,28 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             });
             return if free == Some(true) { HTCAPTION as LRESULT } else { HTCLIENT as LRESULT };
         }
+        WM_NCLBUTTONDOWN => {
+            with(|w| if w.sel.take().is_some() { w.render() });
+        }
         WM_ACTIVATE if (wp & 0xFFFF) as u32 == WA_INACTIVE => {
             // ушли в другое окно — клавишу больше не ловим, иначе съели бы чужой ввод
             with(|w| if w.sel.take().is_some() { w.render() });
         }
         WM_KEYDOWN if wp == VK_ESCAPE as usize => { with(|w| w.close()); }
         WM_KEYS_LOADED => { with(|w| w.loaded()); }
+        WM_TIMER if wp == T_RETRY => {
+            KillTimer(hwnd, T_RETRY);
+            run(Job::Load);
+        }
         WM_PICK_FILE => pick_file(),
         WM_SETCURSOR if (lp & 0xFFFF) as u32 == HTCLIENT => return 1,
+        // любое закрытие (крестик, Esc, Alt+F4): снимаем перехват клавиатуры и забываем окно
         WM_DESTROY => {
-            WIN.with(|c| c.borrow_mut().take());
+            if let Some(w) = WIN.with(|c| c.try_borrow_mut().ok().and_then(|mut b| b.take())) {
+                if !w.hook.is_null() {
+                    UnhookWindowsHookEx(w.hook);
+                }
+            }
         }
         _ => {}
     }

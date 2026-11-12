@@ -333,7 +333,9 @@ impl Dev {
     // Одна правка: свежая таблица из клавиатуры → правка → запись. Первая запись заодно сохраняет таблицу «как было»
     pub fn change(&self, c: Change) -> bool {
         let Some(mut t) = self.read_multi(0x44) else { return false };
-        backup("backup.bin", &t);
+        if !backup("backup.bin", &t) {
+            return false; // копию «как было» не сохранить — не рискуем
+        }
         let before = t.clone();
         apply(&mut t, c) && (t == before || self.write_table(&t)) // ничего не поменялось — не пишем
     }
@@ -359,7 +361,7 @@ impl Dev {
     // Раскладка слоя (0 — обычный, 1 — с Fn, 2 — второй Fn): 126 кодов по позициям матрицы
     pub fn read_keys(&self, layer: u8) -> Option<Vec<u32>> {
         let b = self.read_multi_req(&[0x41, 0, 0, layer << 4]).filter(|b| b.len() >= KEYS * 4)?;
-        Some(b.chunks(4).take(KEYS).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect())
+        Some(codes(&b).take(KEYS).collect())
     }
 
     // Записать слой целиком и перечитать. Первая запись заодно сохраняет все слои «как было»
@@ -369,18 +371,36 @@ impl Dev {
         }
         if !backup_path(KEYS_BACKUP).exists() {
             let Some(all) = (0..3).map(|l| self.read_keys(l)).collect::<Option<Vec<_>>>() else { return false };
-            backup(KEYS_BACKUP, &all.concat().iter().flat_map(|v| v.to_be_bytes()).collect::<Vec<u8>>());
+            if !backup(KEYS_BACKUP, &all.concat().iter().flat_map(|v| v.to_be_bytes()).collect::<Vec<u8>>()) {
+                return false; // копию «как было» не сохранить — не рискуем
+            }
         }
         self.send_checked(&key_frames(layer, keys), &[0x41, 0, 0, layer << 4], |back| {
-            back.chunks(4).take(KEYS).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).eq(keys.iter().copied())
+            codes(back).take(KEYS).eq(keys.iter().copied())
         })
+    }
+
+    // Одна клавиша: свежий слой из клавиатуры → правка → запись. Так не затираются правки,
+    // сделанные мимо окна (возврат из меню трея, родной драйвер)
+    pub fn set_key(&self, layer: u8, i: usize, v: u32) -> bool {
+        let Some(mut k) = self.read_keys(layer) else { return false };
+        match k.get_mut(i) {
+            Some(cur) if *cur == v => true,
+            Some(cur) => {
+                *cur = v;
+                self.write_keys(layer, &k)
+            }
+            None => false,
+        }
     }
 
     // Свой цвет эффекта: первым цветом его палитры, и эффект переключается на этот цвет — как в драйвере
     pub fn set_rgb(&self, mode: u16, (r, g, b): (u8, u8, u8)) -> bool {
         let at = mode as usize * 21;
         let Some(mut p) = self.read_multi(0x49).filter(|p| p.len() >= PALETTE_LEN && at + 3 <= PALETTE_LEN) else { return false };
-        backup("backup-colors.bin", &p);
+        if !backup("backup-colors.bin", &p) {
+            return false;
+        }
         p[at..at + 3].copy_from_slice(&[r, g, b]);
         self.write_palette(&p) && self.change(Change::Color(0))
     }
@@ -478,16 +498,18 @@ fn backup_path(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("KbBatteryTray").join(name)
 }
 
-// Только один раз — самые первые настройки и палитры, до любых правок панелью
-fn backup(name: &str, t: &[u8]) {
+// Только один раз — самые первые настройки, до любых правок. true — копия есть на диске.
+// Пишем во временный файл и переименовываем: оборванная запись не оставит битую копию
+fn backup(name: &str, t: &[u8]) -> bool {
     let p = backup_path(name);
     if p.exists() {
-        return;
+        return true;
     }
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(p, t);
+    let tmp = p.with_extension("tmp");
+    std::fs::write(&tmp, t).is_ok() && std::fs::rename(&tmp, &p).is_ok()
 }
 
 pub fn has_backup() -> bool {
@@ -497,7 +519,7 @@ pub fn has_backup() -> bool {
 // Раскладка «как было» по слоям; None — клавиши ещё не трогали
 pub fn keys_backup() -> Option<Vec<Vec<u32>>> {
     let b = std::fs::read(backup_path(KEYS_BACKUP)).ok().filter(|b| b.len() == 3 * KEYS * 4)?;
-    let all: Vec<u32> = b.chunks(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let all: Vec<u32> = codes(&b).collect();
     Some(all.chunks(KEYS).map(<[u32]>::to_vec).collect())
 }
 
@@ -505,8 +527,18 @@ pub fn keys_backup() -> Option<Vec<Vec<u32>>> {
 pub fn restore_backup(d: &Dev) -> bool {
     let colors = std::fs::read(backup_path("backup-colors.bin")).map_or(true, |p| d.write_palette(&p));
     let table = std::fs::read(backup_path("backup.bin")).map_or(true, |t| d.write_table(&t));
-    let keys = keys_backup().map_or(true, |k| (0..3).all(|l| d.read_keys(l).as_ref() == Some(&k[l as usize]) || d.write_keys(l, &k[l as usize])));
+    let keys = keys_backup().map_or(true, |_| restore_keys(d));
     colors && table && keys
+}
+
+// Раскладку «как было»: переписываем только слои, которые отличаются от копии
+pub fn restore_keys(d: &Dev) -> bool {
+    keys_backup().is_some_and(|k| (0..3).all(|l| d.read_keys(l).as_ref() == Some(&k[l as usize]) || d.write_keys(l, &k[l as usize])))
+}
+
+// Байты клавиатуры → коды клавиш (по 4 байта, старший вперёд)
+fn codes(b: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    b.chunks_exact(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
 }
 
 // ───── свой цвет: оттенок и насыщенность ↔ RGB (яркость цвета — всегда полная, её задаёт яркость подсветки) ─────
@@ -673,7 +705,7 @@ mod tests {
                 println!("слой {layer}: {:?}", k.as_ref().map(|k| k.len()));
                 if let Some(k) = k {
                     let v: Vec<String> = k.chunks(4).enumerate().filter(|(_, c)| c.iter().any(|&b| b != 0))
-                        .map(|(i, c)| format!("{i}:{:08X}", u32::from_be_bytes([c[0], c[1], c[2], c[3]]))).collect();
+                        .map(|(i, c)| format!("{i}:{:08X}", codes(c).next().unwrap_or(0))).collect();
                     println!("{}", v.join(" "));
                 }
             }
@@ -687,10 +719,8 @@ mod tests {
     fn keys_write_live() {
         let ok = with_dev(|d| {
             let orig = d.read_keys(2)?;
-            let mut k = orig.clone();
-            k[0] = 0x29;
             let t = std::time::Instant::now();
-            let wrote = d.write_keys(2, &k);
+            let wrote = d.set_key(2, 0, 0x29) && d.read_keys(2).is_some_and(|k| k[0] == 0x29);
             println!("записал: {wrote} за {:?}, копия: {}", t.elapsed(), keys_backup().is_some());
             let back = d.write_keys(2, &orig);
             println!("вернул: {back}, сейчас как было: {}", d.read_keys(2).as_ref() == Some(&orig));

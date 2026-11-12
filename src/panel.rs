@@ -113,6 +113,17 @@ pub(crate) struct Fonts {
     semibold: *mut GpFontFamily,
 }
 
+impl Drop for Fonts {
+    fn drop(&mut self) {
+        unsafe {
+            if self.semibold != self.regular {
+                GdipDeleteFontFamily(self.semibold);
+            }
+            GdipDeleteFontFamily(self.regular);
+        }
+    }
+}
+
 pub(crate) fn new_fonts() -> Fonts {
     unsafe {
         let mut regular = ptr::null_mut();
@@ -712,7 +723,7 @@ impl Panel {
                 GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
                 GdipScaleWorldTransform(g, self.scale, self.scale, MatrixOrderPrepend);
                 GdipTranslateWorldTransform(g, S, S, MatrixOrderPrepend);
-                draw_card(&Draw { g, f: &self.fonts });
+                draw_card(&Draw { g, f: &self.fonts }, W, H);
                 GdipDeleteGraphics(g);
                 GdipDisposeImage(bmp as *mut GpImage);
             }
@@ -731,7 +742,7 @@ impl Panel {
         let mut hits = Vec::new();
 
         if card {
-            draw_card(&d);
+            draw_card(&d, W, H);
         }
 
         // шапка: название и заряд
@@ -879,14 +890,14 @@ impl Panel {
     }
 }
 
-// Карточка с тенью — фон под всем содержимым панели
-fn draw_card(d: &Draw) {
+// Карточка w×h с тенью — фон под всем содержимым панели и окна клавиш
+pub(crate) fn draw_card(d: &Draw, w: f32, h: f32) {
     for i in (1..=S as i32).rev().step_by(2) {
         let i = i as f32;
-        d.round(-i + 2.0, -i + 5.0, W + 2.0 * i - 4.0, H + 2.0 * i - 4.0, 14.0 + i, 0x0900_0000);
+        d.round(-i + 2.0, -i + 5.0, w + 2.0 * i - 4.0, h + 2.0 * i - 4.0, 14.0 + i, 0x0900_0000);
     }
-    d.round(0.0, 0.0, W, H, 14.0, BG);
-    d.round_outline(0.0, 0.0, W, H, 14.0, 0x1CFF_FFFF);
+    d.round(0.0, 0.0, w, h, 14.0, BG);
+    d.round_outline(0.0, 0.0, w, h, 14.0, 0x1CFF_FFFF);
 }
 
 // Ряд кнопок-сегментов во всю ширину; выбранная — бирюзовая; недоступный ряд — тусклый и не кликается
