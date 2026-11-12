@@ -101,7 +101,20 @@ fn main() {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let tb = ST.with(|s| s.borrow().taskbar_msg);
     match msg {
-        WM_TIMER => { remove_old_exe(); read_battery(hwnd); }
+        WM_TIMER => {
+            if wp != 1 {
+                KillTimer(hwnd, wp); // разовые после втыкания провода
+            }
+            remove_old_exe();
+            read_battery(hwnd);
+        }
+        // воткнули/выдернули USB (в т.ч. провод клавиатуры): переспросим через 1.5 и 5 с,
+        // пока клавиатура переключается; повторные события просто перезапускают таймеры
+        WM_DEVICECHANGE => {
+            SetTimer(hwnd, 2, 1500, None);
+            SetTimer(hwnd, 3, 5000, None);
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
         WM_BATTERY => { update(((wp >> 9) & 1 != 0).then_some((wp as u8, (wp >> 8) & 1 != 0))); notify(NIM_MODIFY); }
         WM_TRAY => match lp as u32 {
             WM_LBUTTONUP => panel::toggle(),
