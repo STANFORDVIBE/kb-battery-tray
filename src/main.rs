@@ -7,6 +7,7 @@
 mod forecast;
 mod kb;
 mod keys;
+mod launch;
 mod panel;
 
 use std::{cell::RefCell, mem, ptr, thread};
@@ -78,6 +79,7 @@ fn main() {
         remove_old_exe();
         SetProcessDPIAware();
         panel::init();
+        launch::register(hwnd);
 
         ST.with(|s| {
             let mut s = s.borrow_mut();
@@ -106,6 +108,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_RBUTTONUP => { panel::hide_now(); menu(hwnd) } // меню стопорит программу — анимация застыла бы на полпути
             _ => {}
         },
+        WM_HOTKEY => launch::fire(wp), // клавиша-запускалка из окна клавиш
         m if m == tb && tb != 0 => notify(NIM_ADD),
         _ => return DefWindowProcW(hwnd, msg, wp, lp),
     }
@@ -132,7 +135,7 @@ unsafe fn menu(hwnd: HWND) {
     match cmd as usize {
         ID_REFRESH => read_battery(hwnd),
         ID_RESTORE => {
-            let ask = "Вернуть подсветку и сон клавиатуры такими, какими они были до первой правки из панели?";
+            let ask = "Вернуть подсветку, сон и раскладку клавиатуры такими, какими они были до первой правки из виджета?";
             if message(hwnd, ask, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES {
                 panel::restore_backup();
             }

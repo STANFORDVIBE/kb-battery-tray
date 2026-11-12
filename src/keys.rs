@@ -26,6 +26,7 @@ const FOOT: f32 = KB_Y + 6.25 * U + 18.0; // строка подсказки п�
 const H: f32 = FOOT + 120.0;
 const S: f32 = 16.0; // поле под тень
 const WM_KEYS_LOADED: u32 = WM_APP + 20;
+const WM_PICK_FILE: u32 = WM_APP + 21;
 
 const FN: usize = 53; // клавиша Fn: её не трогаем, иначе пропадёт Fn-слой
 
@@ -70,6 +71,7 @@ enum Act {
     Close,
     Pick(u32),
     Off,      // клавиша ничего не делает
+    Launch,   // открыть программу или файл (ловит виджет)
     Default,  // как было до виджета
     Cancel,
     ResetAll, // вся раскладка как было
@@ -290,6 +292,7 @@ impl Win {
             }
             Act::Pick(v) => self.assign(v),
             Act::Off => self.assign(0),
+            Act::Launch => unsafe { PostMessageW(self.hwnd, WM_PICK_FILE, 0, 0); }, // диалог — вне этого вызова
             Act::Default => {
                 if let Some(v) = self.sel.and_then(|i| self.orig_of(self.layer, i)) {
                     self.assign(v);
@@ -545,6 +548,7 @@ impl Win {
             for &(name, v) in PICKS {
                 x = chip(&d, x, FOOT + 30.0, name, Act::Pick(v), &mut hits);
             }
+            chip(&d, x, FOOT + 30.0, "Открыть программу…", Act::Launch, &mut hits);
             let mut x = PAD;
             x = chip(&d, x, FOOT + 70.0, "Отключить клавишу", Act::Off, &mut hits);
             if self.orig_of(self.layer, i).is_some_and(|o| Some(o) != keys.as_ref().map(|k| k[i])) {
@@ -697,6 +701,9 @@ fn label(v: u32) -> String {
     let (kind, b2, low) = (v >> 24, (v >> 16) & 0xFF, v & 0xFFFF);
     match kind {
         0 if v == 0 => String::new(),
+        0 if b2 == 0 && (crate::launch::FIRST..=crate::launch::LAST).contains(&low) => {
+            crate::launch::name(low).unwrap_or_else(|| usage_name(low)) // клавиша-запускалка: имя программы
+        }
         0 => {
             const MODS: [&str; 4] = ["Ctrl", "Shift", "Alt", "Win"];
             let mut parts: Vec<String> = (0..8).filter(|b| b2 & (1 << b) != 0).map(|b| MODS[b % 4].to_string()).collect();
@@ -760,6 +767,52 @@ fn sample(layer: u8) -> Vec<u32> {
     k
 }
 
+// «Открыть программу…»: выбрать файл, занять для клавиши свободную F13–F24 и запомнить, что по ней открывать
+fn pick_file() {
+    // клавишу отпускаем до диалога: пока он открыт, хук не должен глотать набор в нём
+    let Some((i, hwnd, own, used)) = with(|w| {
+        let i = w.sel.take()?;
+        let k = w.keys.as_ref()?;
+        Some((i, w.hwnd, k[w.layer as usize][i], k.iter().flatten().copied().collect::<Vec<u32>>()))
+    }).flatten() else { return };
+    let Some(path) = open_dialog(hwnd) else { return };
+    // у клавиши уже своя запускалка — меняем только файл
+    let code = if (crate::launch::FIRST..=crate::launch::LAST).contains(&own) { Some(own) } else { crate::launch::free_code(&used) };
+    let Some(code) = code else {
+        with(|w| { w.note = Some("Все 12 запускалок заняты — освободи какую-нибудь".into()); w.render() });
+        return;
+    };
+    crate::launch::set(code, &path);
+    with(|w| {
+        w.sel = Some(i);
+        w.assign(code);
+        w.render();
+    });
+}
+
+fn open_dialog(owner: HWND) -> Option<String> {
+    use windows_sys::Win32::UI::Controls::Dialogs::*;
+    let mut buf = [0u16; 1024];
+    let filter: Vec<u16> = "Программы и ярлыки\0*.exe;*.lnk;*.url;*.bat;*.cmd\0Все файлы\0*.*\0\0".encode_utf16().collect();
+    let title = w("Что открывать этой клавишей");
+    unsafe {
+        let mut o: OPENFILENAMEW = mem::zeroed();
+        o.lStructSize = mem::size_of::<OPENFILENAMEW>() as u32;
+        o.hwndOwner = owner;
+        o.lpstrFilter = filter.as_ptr();
+        o.lpstrFile = buf.as_mut_ptr();
+        o.nMaxFile = buf.len() as u32;
+        o.lpstrTitle = title.as_ptr();
+        // ярлык оставляем ярлыком: в нём бывают параметры запуска
+        o.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_NODEREFERENCELINKS | OFN_EXPLORER;
+        if GetOpenFileNameW(&mut o) == 0 {
+            return None;
+        }
+    }
+    let n = buf.iter().position(|&c| c == 0).unwrap_or(0);
+    (n > 0).then(|| String::from_utf16_lossy(&buf[..n]))
+}
+
 // ───── окно и хук ─────
 
 unsafe extern "system" fn ll_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -797,6 +850,7 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
         }
         WM_KEYDOWN if wp == VK_ESCAPE as usize => { with(|w| w.close()); }
         WM_KEYS_LOADED => { with(|w| w.loaded()); }
+        WM_PICK_FILE => pick_file(),
         WM_SETCURSOR if (lp & 0xFFFF) as u32 == HTCLIENT => return 1,
         WM_DESTROY => {
             WIN.with(|c| c.borrow_mut().take());
