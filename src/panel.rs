@@ -20,7 +20,7 @@ use windows_sys::Win32::{
 
 // ───── размеры (логические пиксели, умножаются на масштаб экрана) ─────
 const W: f32 = 360.0;
-const H: f32 = 540.0;
+const H: f32 = 590.0;
 const PAD: f32 = 20.0;
 const S: f32 = 16.0; // поле вокруг панели под тень
 const GAP: f32 = 12.0; // отступ от панели задач
@@ -55,6 +55,8 @@ enum Act {
     Bright(u8),
     Speed(u8),
     Color(u8),
+    Hue, // полоска оттенков своего цвета: значение — где кликнули
+    Sat, // полоска насыщенности: от белого к оттенку
     Sleep(u8),
 }
 
@@ -117,6 +119,7 @@ thread_local! {
 #[derive(Clone, Copy)]
 enum Job {
     Change(Change),
+    Rgb(u16, (u8, u8, u8)), // свой цвет эффекта
     Restore, // вернуть таблицу «как до виджета»
 }
 
@@ -128,7 +131,7 @@ struct Loaded {
 static RESULT: Mutex<Option<Loaded>> = Mutex::new(None);
 static SEQ: AtomicU64 = AtomicU64::new(0);
 static TX: OnceLock<Mutex<mpsc::Sender<(u64, Option<Job>)>>> = OnceLock::new();
-static FAKE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+static FAKE: Mutex<(Vec<u8>, Vec<u8>)> = Mutex::new((Vec::new(), Vec::new())); // таблица и палитры без клавиатуры
 
 // Выполнить запись (если есть) и перечитать всё с клавиатуры; ответ придёт окну сообщением WM_LOADED.
 // Один рабочий поток и очередь: правки уходят в клавиатуру строго в порядке кликов.
@@ -145,21 +148,32 @@ fn worker(hwnd: isize, rx: mpsc::Receiver<(u64, Option<Job>)>) {
         let mut batch = vec![first];
         batch.extend(rx.try_iter());
         let seq = batch.last().map_or(0, |b| b.0);
-        let jobs: Vec<Job> = batch.into_iter().filter_map(|b| b.1).collect();
+        let mut jobs: Vec<Job> = batch.into_iter().filter_map(|b| b.1).collect();
+        // палитра пишется ~1 с: из нескольких кликов по полоске важен только последний
+        let last_rgb = jobs.iter().rposition(|j| matches!(j, Job::Rgb(..)));
+        let mut i = 0;
+        jobs.retain(|j| { i += 1; !matches!(j, Job::Rgb(..)) || Some(i - 1) == last_rgb });
         let _l = kb::lock();
         let mut out = Loaded { seq, cfg: None, battery: None };
         if cfg!(debug_assertions) && std::env::var_os("KB_FAKE").is_some() {
             // только для скриншотов без клавиатуры: подставная таблица с живой F75
-            let mut t = FAKE.lock().unwrap_or_else(|e| e.into_inner());
+            let mut f = FAKE.lock().unwrap_or_else(|e| e.into_inner());
+            let (t, pal) = &mut *f;
             if t.is_empty() {
                 *t = kb::SAMPLE.to_vec();
+                *pal = kb::PALETTE.iter().flat_map(|c| [c.0, c.1, c.2]).collect::<Vec<u8>>().repeat(24);
             }
             for &j in &jobs {
-                if let Job::Change(c) = j {
-                    kb::apply(&mut t, c);
+                match j {
+                    Job::Change(c) => { kb::apply(t, c); }
+                    Job::Rgb(m, (r, g, b)) => {
+                        pal[m as usize * 21..][..3].copy_from_slice(&[r, g, b]);
+                        kb::apply(t, Change::Color(0));
+                    }
+                    Job::Restore => {}
                 }
             }
-            out.cfg = Some(Config { table: t.clone(), palette: Vec::new() });
+            out.cfg = Some(Config { table: t.clone(), palette: pal.clone() });
             out.battery = Some((76, false));
         } else {
             let mut jobs = jobs.into_iter();
@@ -167,6 +181,7 @@ fn worker(hwnd: isize, rx: mpsc::Receiver<(u64, Option<Job>)>) {
                 for j in jobs.by_ref() {
                     match j {
                         Job::Change(c) => { d.change(c); }
+                        Job::Rgb(m, rgb) => { d.set_rgb(m, rgb); }
                         Job::Restore => { kb::restore_backup(d); }
                     }
                 }
@@ -456,8 +471,25 @@ impl Panel {
         if self.animating() {
             return;
         }
+        let (x, _) = self.logical(lp);
         let Some(act) = self.hit(self.logical(lp)) else { return };
         let Some(c) = self.cfg.as_mut() else { return };
+        if matches!(act, Act::Hue | Act::Sat) {
+            let k = ((x - PAD) / (W - 2.0 * PAD)).clamp(0.0, 1.0);
+            let (h, s) = kb::hue_sat(c.swatch(0));
+            let rgb = if act == Act::Hue { kb::hsv(k, if s < 0.05 { 1.0 } else { s }) } else { kb::hsv(h, k) };
+            let mode = c.mode();
+            // на экране — сразу: первый цвет палитры эффекта и выбор этого цвета
+            let at = mode as usize * 21;
+            if c.palette.len() < at + 3 {
+                c.palette = kb::PALETTE.iter().flat_map(|c| [c.0, c.1, c.2]).collect::<Vec<u8>>().repeat(24);
+            }
+            c.palette[at..at + 3].copy_from_slice(&[rgb.0, rgb.1, rgb.2]);
+            kb::apply(&mut c.table, Change::Color(0));
+            run(Some(Job::Rgb(mode, rgb)));
+            self.render();
+            return;
+        }
         let change = match act {
             Act::Power if c.mode() == 0 => Change::Mode(self.last_mode),
             Act::Power => Change::Mode(0),
@@ -466,6 +498,7 @@ impl Panel {
             Act::Speed(v) => Change::Speed(v),
             Act::Color(v) => Change::Color(v),
             Act::Sleep(v) => Change::Sleep(v),
+            Act::Hue | Act::Sat => return,
         };
         if !kb::apply(&mut c.table, change) {
             return;
@@ -734,12 +767,29 @@ impl Panel {
                     hits.push((rf(x - 3.0, y - 3.0, size + 6.0, size + 6.0), act));
                 }
             }
+            // свой цвет: оттенок и насыщенность; кладётся первым цветом палитры (первый кружок)
+            let (h, sat) = kb::hue_sat(c.swatch(0));
+            let full = |(r, g, b): (u8, u8, u8)| 0xFF00_0000 | (r as u32) << 16 | (g as u32) << 8 | b as u32;
+            let hue: Vec<u32> = (0..=6).map(|i| full(kb::hsv(i as f32 / 6.0, 1.0))).collect();
+            let fade = [0xFFFF_FFFF, full(kb::hsv(h, 1.0))];
+            let custom = cur == Some(0);
+            for (k, (colors, pos, act)) in [(&hue[..], h, Act::Hue), (&fade[..], sat, Act::Sat)].into_iter().enumerate() {
+                let r = rf(PAD, 462.0 + k as f32 * 26.0, W - 2.0 * PAD, 16.0);
+                d.gradient(r, colors, if lit { 0xFF } else { 0x40 });
+                if lit {
+                    let mx = r.X + pos * r.Width;
+                    let ring = if custom { FG } else { MUTED };
+                    d.ellipse(mx - 8.0, r.Y - 1.0, 18.0, 18.0, ring);
+                    d.ellipse(mx - 5.0, r.Y + 2.0, 12.0, 12.0, full(c.swatch(0)));
+                    hits.push((rf(r.X, r.Y - 5.0, r.Width, r.Height + 10.0), act));
+                }
+            }
         }
 
         // сон
         let labels: Vec<(String, Act)> = kb::SLEEP.iter().map(|&(v, l)| (l.to_string(), Act::Sleep(v))).collect();
-        d.text("Засыпать через", 12.0, false, MUTED, rf(PAD, 466.0, 200.0, 18.0), Align::Left);
-        segments(&d, 486.0, &labels, Some(Act::Sleep(c.sleep())), hov, &mut hits, true);
+        d.text("Засыпать через", 12.0, false, MUTED, rf(PAD, 516.0, 200.0, 18.0), Align::Left);
+        segments(&d, 536.0, &labels, Some(Act::Sleep(c.sleep())), hov, &mut hits, true);
 
         self.hits = hits;
     }
@@ -839,6 +889,23 @@ impl Draw<'_> {
             GdipCreateSolidFill(c, &mut b);
             GdipFillEllipse(self.g, b as *mut GpBrush, x, y, w, h);
             GdipDeleteBrush(b as *mut GpBrush);
+        }
+    }
+
+    // Скруглённая полоска с горизонтальным переходом через colors (равные доли); alpha — общая прозрачность
+    fn gradient(&self, r: RectF, colors: &[u32], alpha: u32) {
+        let cs: Vec<u32> = colors.iter().map(|c| (alpha << 24) | (c & 0xFF_FFFF)).collect();
+        let pos: Vec<f32> = (0..cs.len()).map(|i| i as f32 / (cs.len() - 1) as f32).collect();
+        unsafe {
+            let p = Self::path(r.X, r.Y, r.Width, r.Height, r.Height / 2.0);
+            // полоса кисти чуть шире полоски — иначе на краях проступает соседний цвет
+            let br = rf(r.X - 1.0, r.Y, r.Width + 2.0, r.Height);
+            let mut b = ptr::null_mut();
+            GdipCreateLineBrushFromRect(&br, cs[0], cs[cs.len() - 1], LinearGradientModeHorizontal, WrapModeTileFlipX, &mut b);
+            GdipSetLinePresetBlend(b, cs.as_ptr(), pos.as_ptr(), cs.len() as i32);
+            GdipFillPath(self.g, b as *mut GpBrush, p);
+            GdipDeleteBrush(b as *mut GpBrush);
+            GdipDeletePath(p);
         }
     }
 

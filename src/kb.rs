@@ -3,6 +3,7 @@
 // Настройки живут в «таблице» ~140 байт: 0x44 — прочитать (ответ пачкой кадров: [2]=всего, [3]=номер, данные [5..19)),
 // 0x04 — записать целиком (кадры [1]=4, [2]=всего, [3]=номер, [4]=длина, 14 байт данных). Драйвер делает так же:
 // читает таблицу, правит пару байт, пишет обратно. 0x49 — палитры подсветки (по 7 цветов на эффект), их только читаем.
+// 0x09 — записать палитры (так драйвер ставит «свой цвет»: кладёт его первым цветом палитры эффекта).
 // В таблице: [9..11) — эффект подсветки, [24] — сон; после пары FF FF (s) у каждого эффекта m по два байта:
 // s+2m-2 — яркость, s+2m-1 — скорость << 4 | цвет (0..6 — номер цвета палитры, 7 — радуга).
 use std::{mem, ptr, thread, time::Duration};
@@ -28,6 +29,7 @@ pub const BRIGHT: &[u8] = &[1, 3, 5, 7, 9];
 pub const SPEED: &[u8] = &[0, 1, 2, 3, 4];
 // сон: код в таблице — как в драйвере (0 — никогда, 2 — 1 мин, 10 — 5 мин, 20 — 10 мин, 40 — 20 мин)
 pub const SLEEP: &[(u8, &str)] = &[(2, "1 мин"), (10, "5 мин"), (20, "10 мин"), (40, "20 мин"), (0, "Никогда")];
+const PALETTE_LEN: usize = 480; // драйвер пишет первые 480 байт палитр (по 21 на эффект), хвост — нули и метка 5A A5
 // палитра по умолчанию — если цвета не прочитались
 pub const PALETTE: [(u8, u8, u8); 7] = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255), (255, 255, 255)];
 
@@ -317,9 +319,47 @@ impl Dev {
     // Одна правка: свежая таблица из клавиатуры → правка → запись. Первая запись заодно сохраняет таблицу «как было»
     pub fn change(&self, c: Change) -> bool {
         let Some(mut t) = self.read_multi(0x44) else { return false };
-        backup(&t);
+        backup("backup.bin", &t);
         apply(&mut t, c) && self.write_table(&t)
     }
+
+    // Записать палитры и перечитать: true — клавиатура запомнила ровно это
+    fn write_palette(&self, p: &[u8]) -> bool {
+        if p.len() < PALETTE_LEN {
+            return false;
+        }
+        for f in palette_frames(p) {
+            if !self.write(&f) {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(PACE_MS));
+        }
+        thread::sleep(Duration::from_millis(150));
+        self.read_multi(0x49).is_some_and(|back| back.get(..PALETTE_LEN) == p.get(..PALETTE_LEN))
+    }
+
+    // Свой цвет эффекта: первым цветом его палитры, и эффект переключается на этот цвет — как в драйвере
+    pub fn set_rgb(&self, mode: u16, (r, g, b): (u8, u8, u8)) -> bool {
+        let at = mode as usize * 21;
+        let Some(mut p) = self.read_multi(0x49).filter(|p| p.len() >= PALETTE_LEN && at + 3 <= PALETTE_LEN) else { return false };
+        backup("backup-colors.bin", &p);
+        p[at..at + 3].copy_from_slice(&[r, g, b]);
+        self.write_palette(&p) && self.change(Change::Color(0))
+    }
+}
+
+// Кадры записи палитр — как у драйвера: 37 кадров по 14 байт, первые 480 байт палитр, дальше нули,
+// в последнем кадре длина 8 и метка 5A A5 (байты 506–507)
+fn palette_frames(p: &[u8]) -> Vec<[u8; 20]> {
+    let mut data = p[..PALETTE_LEN].to_vec();
+    data.resize(37 * 14, 0);
+    data[506] = 0x5A;
+    data[507] = 0xA5;
+    (0..37).map(|i| {
+        let mut body = vec![0x09, 37, i as u8, if i == 36 { 8 } else { 14 }];
+        body.extend(&data[i * 14..i * 14 + 14]);
+        frame(&body)
+    }).collect()
 }
 
 // Кадры записи таблицы — байт в байт как у драйвера (у последнего кадра длина хвоста, у полного — 2)
@@ -379,13 +419,13 @@ unsafe fn is_vendor_if(h: HANDLE) -> bool {
 
 // ───── копия настроек «как было до виджета» ─────
 
-pub fn backup_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("KbBatteryTray").join("backup.bin")
+fn backup_path(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("KbBatteryTray").join(name)
 }
 
-// Только один раз — самая первая таблица, до любых правок панелью
-fn backup(t: &[u8]) {
-    let p = backup_path();
+// Только один раз — самые первые настройки и палитры, до любых правок панелью
+fn backup(name: &str, t: &[u8]) {
+    let p = backup_path(name);
     if p.exists() {
         return;
     }
@@ -396,11 +436,45 @@ fn backup(t: &[u8]) {
 }
 
 pub fn has_backup() -> bool {
-    backup_path().exists()
+    backup_path("backup.bin").exists() || backup_path("backup-colors.bin").exists()
 }
 
+// Палитры возвращаем, только если их меняли (есть копия)
 pub fn restore_backup(d: &Dev) -> bool {
-    std::fs::read(backup_path()).is_ok_and(|t| d.write_table(&t))
+    let colors = std::fs::read(backup_path("backup-colors.bin")).map_or(true, |p| d.write_palette(&p));
+    let table = std::fs::read(backup_path("backup.bin")).map_or(true, |t| d.write_table(&t));
+    colors && table
+}
+
+// ───── свой цвет: оттенок и насыщенность ↔ RGB (яркость цвета — всегда полная, её задаёт яркость подсветки) ─────
+
+pub fn hsv(h: f32, s: f32) -> (u8, u8, u8) {
+    let h = h.rem_euclid(1.0) * 6.0;
+    let f = h.fract();
+    let (p, q, t) = (1.0 - s, 1.0 - s * f, 1.0 - s * (1.0 - f));
+    let (r, g, b) = match h as u32 {
+        0 => (1.0, t, p),
+        1 => (q, 1.0, p),
+        2 => (p, 1.0, t),
+        3 => (p, q, 1.0),
+        4 => (t, p, 1.0),
+        _ => (1.0, p, q),
+    };
+    let c = |v: f32| (v * 255.0).round() as u8;
+    (c(r), c(g), c(b))
+}
+
+// (оттенок 0..1, насыщенность 0..1); у серых оттенок 0
+pub fn hue_sat((r, g, b): (u8, u8, u8)) -> (f32, f32) {
+    let (r, g, b) = (r as f32, g as f32, b as f32);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let d = max - min;
+    if max == 0.0 || d == 0.0 {
+        return (0.0, 0.0);
+    }
+    let h = if max == r { (g - b) / d } else if max == g { 2.0 + (b - r) / d } else { 4.0 + (r - g) / d };
+    ((h / 6.0).rem_euclid(1.0), d / max)
 }
 
 #[cfg(test)]
@@ -460,6 +534,32 @@ mod tests {
     }
 
     #[test]
+    fn palette_frames_match_driver() {
+        let mut p = vec![0u8; 490];
+        p[21..24].copy_from_slice(&[1, 2, 3]);
+        let f = palette_frames(&p);
+        assert_eq!(f.len(), 37);
+        assert_eq!(f[1][..5], [0x13, 0x09, 37, 1, 14]);
+        assert_eq!(f[1][5 + 7..5 + 10], [1, 2, 3]); // байты 21..24 — второй кадр, с 7-го
+        assert_eq!(f[36][..5], [0x13, 0x09, 37, 36, 8]);
+        assert_eq!(f[36][5 + 2..5 + 4], [0x5A, 0xA5]);
+        assert!(f.iter().all(|x| x[19] == sum(&x[..19])));
+    }
+
+    #[test]
+    fn color_round_trip() {
+        assert_eq!(hsv(0.0, 1.0), (255, 0, 0));
+        assert_eq!(hsv(1.0 / 3.0, 1.0), (0, 255, 0));
+        assert_eq!(hsv(0.5, 0.0), (255, 255, 255));
+        for &c in &[(255, 0, 0), (0, 0, 255), (255, 128, 0), (255, 255, 255), (128, 255, 200)] {
+            let (h, s) = hue_sat(c);
+            let back = hsv(h, s);
+            let d = |a: u8, b: u8| a.abs_diff(b);
+            assert!(d(back.0, c.0) <= 1 && d(back.1, c.1) <= 1 && d(back.2, c.2) <= 1, "{c:?} → {back:?}");
+        }
+    }
+
+    #[test]
     fn parses_real_battery_replies() {
         let h = |s: &str| -> [u8; 20] { hex(s).try_into().unwrap() };
         // сняты с живой клавиатуры
@@ -497,7 +597,18 @@ mod tests {
             println!("правка дошла: {changed} за {:?}", t.elapsed());
             let restored = d.write_table(&orig);
             println!("вернул как было: {restored}");
-            Some(changed && restored)
+            // свой цвет: в палитру эффекта и обратно (сам эффект на палитре не переключаем — подсветка не мигнёт)
+            let pal = d.read_multi(0x49)?;
+            let mode = u16::from_be_bytes([orig[9], orig[10]]).max(1);
+            let at = mode as usize * 21;
+            let mut p = pal.clone();
+            p[at..at + 3].copy_from_slice(&[12, 34, 56]);
+            let t = std::time::Instant::now();
+            let colored = d.write_palette(&p);
+            println!("палитра дошла: {colored} за {:?}", t.elapsed());
+            let back = d.write_palette(&pal);
+            println!("палитру вернул: {back}");
+            Some(changed && restored && colored && back)
         });
         assert_eq!(ok, Some(true));
     }
