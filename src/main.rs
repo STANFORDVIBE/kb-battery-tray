@@ -6,6 +6,7 @@
 
 mod forecast;
 mod kb;
+mod keys;
 mod panel;
 
 use std::{cell::RefCell, mem, ptr, thread};

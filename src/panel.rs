@@ -29,19 +29,19 @@ const CLOSE_MS: f32 = 330.0;
 const SLIDE: f32 = 40.0; // запасная анимация, если панель задач сверху или сбоку
 
 // ───── цвета ARGB, как у панели мыши ─────
-const BG: u32 = 0xFF14_1A26;
-const CARD: u32 = 0xFF20_293A;
-const CARD_HOVER: u32 = 0xFF2E_3A50;
-const FG: u32 = 0xFFEC_F0F6;
-const MUTED: u32 = 0xFF8A_96AA;
-const DIM: u32 = 0xFF4A_5468; // текст недоступных кнопок
-const ACCENT: u32 = 0xFF4F_C3B0;
+pub(crate) const BG: u32 = 0xFF14_1A26;
+pub(crate) const CARD: u32 = 0xFF20_293A;
+pub(crate) const CARD_HOVER: u32 = 0xFF2E_3A50;
+pub(crate) const FG: u32 = 0xFFEC_F0F6;
+pub(crate) const MUTED: u32 = 0xFF8A_96AA;
+pub(crate) const DIM: u32 = 0xFF4A_5468; // текст недоступных кнопок
+pub(crate) const ACCENT: u32 = 0xFF4F_C3B0;
 const GREEN: u32 = 0xFF34_C759;
 const RED: u32 = 0xFFFF_3B30;
 const YELLOW: u32 = 0xFFFF_D60A;
 
 const WM_MOUSELEAVE: u32 = 0x02A3; // нет в windows-sys без лишней фичи
-const PARGB: i32 = 0xE200B; // PixelFormat32bppPARGB
+pub(crate) const PARGB: i32 = 0xE200B; // PixelFormat32bppPARGB
 const WM_LOADED: u32 = WM_APP + 10;
 const WM_CLOSE_PANEL: u32 = WM_APP + 11;
 const WM_ANIM: u32 = WM_APP + 12;
@@ -58,6 +58,7 @@ enum Act {
     Hue, // полоска оттенков своего цвета: значение — где кликнули
     Sat, // полоска насыщенности: от белого к оттенку
     Sleep(u8),
+    Keys, // значок клавиатуры в шапке — окно с раскладкой
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -107,9 +108,22 @@ struct Panel {
     fonts: Fonts,
 }
 
-struct Fonts {
+pub(crate) struct Fonts {
     regular: *mut GpFontFamily,
     semibold: *mut GpFontFamily,
+}
+
+pub(crate) fn new_fonts() -> Fonts {
+    unsafe {
+        let mut regular = ptr::null_mut();
+        let mut semibold = ptr::null_mut();
+        GdipCreateFontFamilyFromName(w("Segoe UI").as_ptr(), ptr::null_mut(), &mut regular);
+        GdipCreateFontFamilyFromName(w("Segoe UI Semibold").as_ptr(), ptr::null_mut(), &mut semibold);
+        if semibold.is_null() {
+            semibold = regular;
+        }
+        Fonts { regular, semibold }
+    }
 }
 
 thread_local! {
@@ -243,21 +257,13 @@ pub fn init() {
         let scale = GetDeviceCaps(sdc, LOGPIXELSX as _) as f32 / 96.0;
         ReleaseDC(ptr::null_mut(), sdc);
 
-        let mut regular = ptr::null_mut();
-        let mut semibold = ptr::null_mut();
-        GdipCreateFontFamilyFromName(w("Segoe UI").as_ptr(), ptr::null_mut(), &mut regular);
-        GdipCreateFontFamilyFromName(w("Segoe UI Semibold").as_ptr(), ptr::null_mut(), &mut semibold);
-        if semibold.is_null() {
-            semibold = regular;
-        }
-
         let p = Panel {
             hwnd, scale, cfg: None, confirmed: None, battery: None, last_mode: 1, drag: None, hs: ((0, 0, 0), (0.0, 0.0)), status: Status::Loading,
             hits: Vec::new(), hover: None, entered: false, visible: false, closing: false, progress: 0.0, anim_from: 0.0,
             anim_start: Instant::now(), hidden_at: None, anchor: POINT { x: 0, y: 0 }, panel_rc: mem::zeroed(),
             genie: true, slide: (0.0, 1.0), snap: Vec::new(), snap_w: 0, card: (0, 0, Vec::new()), fg_at_open: ptr::null_mut(),
             dc: ptr::null_mut(), dib: ptr::null_mut(), old: ptr::null_mut(), bits: ptr::null_mut(), buf_w: 0, buf_h: 0,
-            fonts: Fonts { regular, semibold },
+            fonts: new_fonts(),
         };
         P.with(|c| *c.borrow_mut() = Some(p));
     }
@@ -543,6 +549,10 @@ impl Panel {
             return;
         }
         let Some(act) = self.hit(self.logical(lp)) else { return };
+        if act == Act::Keys {
+            crate::keys::open(); // панель свернётся сама: фокус ушёл в окно клавиш
+            return;
+        }
         let Some(c) = self.cfg.as_mut() else { return };
         let change = match act {
             Act::Power if c.mode() == 0 => Change::Mode(self.last_mode),
@@ -552,7 +562,7 @@ impl Panel {
             Act::Speed(v) => Change::Speed(v),
             Act::Color(v) => Change::Color(v),
             Act::Sleep(v) => Change::Sleep(v),
-            Act::Hue | Act::Sat => return, // их ведёт press()
+            Act::Hue | Act::Sat | Act::Keys => return, // их ведёт press(), окно клавиш — выше
         };
         if !kb::apply(&mut c.table, change) {
             return;
@@ -726,6 +736,20 @@ impl Panel {
 
         // шапка: название и заряд
         d.text("AULA F75", 18.0, true, FG, rf(PAD, 16.0, 200.0, 26.0), Align::Left);
+        // значок клавиатуры: открывает окно с раскладкой
+        let kr = rf(PAD + 88.0, 15.0, 34.0, 28.0);
+        if self.hover == Some(Act::Keys) {
+            d.round(kr.X, kr.Y, kr.Width, kr.Height, 8.0, CARD_HOVER);
+        }
+        let (kx, ky) = (kr.X + 7.0, kr.Y + 7.0);
+        d.round_outline(kx, ky, 20.0, 14.0, 3.0, MUTED);
+        for (row, n) in [(0.0, 4), (4.0, 4)] {
+            for k in 0..n {
+                d.round(kx + 3.5 + k as f32 * 3.6, ky + 3.0 + row, 2.2, 2.2, 0.6, MUTED);
+            }
+        }
+        d.round(kx + 5.0, ky + 10.0, 10.0, 1.8, 0.9, MUTED);
+        hits.push((kr, Act::Keys));
         if let Some((pct, ch)) = self.battery {
             let x = W - PAD - 30.0;
             let fill = if ch { YELLOW } else if pct <= 20 { RED } else { GREEN };
@@ -888,18 +912,18 @@ fn segments(d: &Draw, y: f32, items: &[(String, Act)], selected: Option<Act>, ho
 // ───── GDI+ помощники ─────
 
 #[derive(Clone, Copy)]
-enum Align {
+pub(crate) enum Align {
     Left,
     Center,
     Right,
 }
 
-struct Draw<'a> {
-    g: *mut GpGraphics,
-    f: &'a Fonts,
+pub(crate) struct Draw<'a> {
+    pub(crate) g: *mut GpGraphics,
+    pub(crate) f: &'a Fonts,
 }
 
-fn rf(x: f32, y: f32, w: f32, h: f32) -> RectF {
+pub(crate) fn rf(x: f32, y: f32, w: f32, h: f32) -> RectF {
     RectF { X: x, Y: y, Width: w, Height: h }
 }
 
@@ -918,7 +942,7 @@ impl Draw<'_> {
         p
     }
 
-    fn round(&self, x: f32, y: f32, w: f32, h: f32, r: f32, c: u32) {
+    pub(crate) fn round(&self, x: f32, y: f32, w: f32, h: f32, r: f32, c: u32) {
         if w <= 0.0 || h <= 0.0 {
             return;
         }
@@ -932,7 +956,7 @@ impl Draw<'_> {
         }
     }
 
-    fn round_outline(&self, x: f32, y: f32, w: f32, h: f32, r: f32, c: u32) {
+    pub(crate) fn round_outline(&self, x: f32, y: f32, w: f32, h: f32, r: f32, c: u32) {
         unsafe {
             let p = Self::path(x, y, w, h, r);
             let mut pen = ptr::null_mut();
@@ -943,7 +967,7 @@ impl Draw<'_> {
         }
     }
 
-    fn ellipse(&self, x: f32, y: f32, w: f32, h: f32, c: u32) {
+    pub(crate) fn ellipse(&self, x: f32, y: f32, w: f32, h: f32, c: u32) {
         unsafe {
             let mut b = ptr::null_mut();
             GdipCreateSolidFill(c, &mut b);
@@ -982,7 +1006,7 @@ impl Draw<'_> {
         }
     }
 
-    fn text(&self, s: &str, size: f32, bold: bool, c: u32, r: RectF, align: Align) {
+    pub(crate) fn text(&self, s: &str, size: f32, bold: bool, c: u32, r: RectF, align: Align) {
         unsafe {
             let mut font = ptr::null_mut();
             GdipCreateFont(if bold { self.f.semibold } else { self.f.regular }, size, 0, UnitPixel, &mut font);
@@ -1076,7 +1100,7 @@ fn smooth(k: f32) -> f32 { k * k * (3.0 - 2.0 * k) }
 
 // ───── система ─────
 
-fn monitor_rects(pt: POINT) -> (RECT, RECT) {
+pub(crate) fn monitor_rects(pt: POINT) -> (RECT, RECT) {
     unsafe {
         let m = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
         let mut mi: MONITORINFO = mem::zeroed();
@@ -1099,7 +1123,7 @@ fn overflow_rect() -> Option<RECT> {
 }
 
 // Windows не даёт просто так забрать фокус у чужого окна; на время подключаемся к очереди ввода активного окна
-fn force_foreground(h: HWND) {
+pub(crate) fn force_foreground(h: HWND) {
     unsafe {
         let fg = GetForegroundWindow();
         let fg_thread = GetWindowThreadProcessId(fg, ptr::null_mut());

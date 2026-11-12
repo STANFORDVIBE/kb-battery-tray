@@ -24,6 +24,8 @@ pub const NO_COLOR: &[u16] = &[3, 15, 16, 17]; // свои цвета у эфф�
 pub const NO_SPEED: &[u16] = &[1]; // статике скорость ни к чему
 const NO_SLOT: &[u16] = &[0, 19, 275, 277]; // у этих нет яркости/скорости в таблице
 pub const RAINBOW: u8 = 7;
+pub const KEYS: usize = 126; // позиций в матрице раскладки: 21 столбец × 6 рядов
+const KEYS_BACKUP: &str = "backup-keys.bin";
 // shortcut: шкалы яркости и скорости подобраны по заводским значениям (яркость 9, скорость 3); драйвер пускает до 20 — расширить, если 9 окажется не максимумом
 pub const BRIGHT: &[u8] = &[1, 3, 5, 7, 9];
 pub const SPEED: &[u8] = &[0, 1, 2, 3, 4];
@@ -239,14 +241,14 @@ impl Dev {
     }
 
     // Запрос и ответ на него; по пути могут влезть чужие кадры (сам по себе раз в ~11 с приходит 0x0A) — пропускаем
-    fn ask(&self, cmd: u8, ms: u32) -> Option<[u8; 20]> {
+    fn ask(&self, body: &[u8], ms: u32) -> Option<[u8; 20]> {
         unsafe { HidD_FlushQueue(self.h) };
-        if !self.write(&frame(&[cmd])) {
+        if !self.write(&frame(body)) {
             return None;
         }
         for _ in 0..8 {
             let r = self.read(ms)?;
-            if r[1] == cmd {
+            if r[1] == body[0] {
                 return Some(r);
             }
         }
@@ -270,14 +272,20 @@ impl Dev {
     // Код модели: F75 — 0x0300000000CD
     #[cfg(test)]
     pub fn model(&self) -> Option<u64> {
-        let r = self.ask(0x05, 1000)?;
+        let r = self.ask(&[0x05], 1000)?;
         Some(r[5..11].iter().fold(0u64, |a, &b| a << 8 | b as u64))
     }
 
     // Длинный ответ пачкой кадров; данные кадра — [5..19)
     fn read_multi(&self, cmd: u8) -> Option<Vec<u8>> {
+        self.read_multi_req(&[cmd])
+    }
+
+    // То же с параметрами запроса (например, слой раскладки)
+    fn read_multi_req(&self, body: &[u8]) -> Option<Vec<u8>> {
+        let cmd = body[0];
         for _ in 0..3 {
-            let Some(first) = self.ask(cmd, 1000) else { continue };
+            let Some(first) = self.ask(body, 1000) else { continue };
             let total = first[2] as usize;
             if total == 0 {
                 continue;
@@ -309,15 +317,15 @@ impl Dev {
         if t.len() < 100 || slot(t, 1).is_none() {
             return false; // не наша таблица — мусор в клавиатуру не пишем
         }
-        self.send_checked(&table_frames(t), 0x44, |back| back == t)
+        self.send_checked(&table_frames(t), &[0x44], |back| back == t)
     }
 
     // Отправить и перечитать; не сошлось — ещё раз с паузой побольше
-    fn send_checked(&self, frames: &[[u8; 20]], read_cmd: u8, same: impl Fn(&[u8]) -> bool) -> bool {
+    fn send_checked(&self, frames: &[[u8; 20]], read: &[u8], same: impl Fn(&[u8]) -> bool) -> bool {
         [PACE_MS, SAFE_PACE_MS].into_iter().any(|pace| {
             self.send(frames, pace) && {
                 thread::sleep(Duration::from_millis(30));
-                self.read_multi(read_cmd).is_some_and(|back| same(&back))
+                self.read_multi_req(read).is_some_and(|back| same(&back))
             }
         })
     }
@@ -345,7 +353,27 @@ impl Dev {
         if p.len() < PALETTE_LEN {
             return false;
         }
-        self.send_checked(&palette_frames(p), 0x49, |back| back.get(..PALETTE_LEN) == p.get(..PALETTE_LEN))
+        self.send_checked(&palette_frames(p), &[0x49], |back| back.get(..PALETTE_LEN) == p.get(..PALETTE_LEN))
+    }
+
+    // Раскладка слоя (0 — обычный, 1 — с Fn, 2 — второй Fn): 126 кодов по позициям матрицы
+    pub fn read_keys(&self, layer: u8) -> Option<Vec<u32>> {
+        let b = self.read_multi_req(&[0x41, 0, 0, layer << 4]).filter(|b| b.len() >= KEYS * 4)?;
+        Some(b.chunks(4).take(KEYS).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect())
+    }
+
+    // Записать слой целиком и перечитать. Первая запись заодно сохраняет все слои «как было»
+    pub fn write_keys(&self, layer: u8, keys: &[u32]) -> bool {
+        if keys.len() != KEYS || layer > 2 {
+            return false;
+        }
+        if !backup_path(KEYS_BACKUP).exists() {
+            let Some(all) = (0..3).map(|l| self.read_keys(l)).collect::<Option<Vec<_>>>() else { return false };
+            backup(KEYS_BACKUP, &all.concat().iter().flat_map(|v| v.to_be_bytes()).collect::<Vec<u8>>());
+        }
+        self.send_checked(&key_frames(layer, keys), &[0x41, 0, 0, layer << 4], |back| {
+            back.chunks(4).take(KEYS).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).eq(keys.iter().copied())
+        })
     }
 
     // Свой цвет эффекта: первым цветом его палитры, и эффект переключается на этот цвет — как в драйвере
@@ -368,6 +396,23 @@ fn palette_frames(p: &[u8]) -> Vec<[u8; 20]> {
     (0..37).map(|i| {
         let mut body = vec![0x09, 37, i as u8, if i == 36 { 8 } else { 14 }];
         body.extend(&data[i * 14..i * 14 + 14]);
+        frame(&body)
+    }).collect()
+}
+
+// Кадры записи раскладки — как у драйвера: 512 байт (коды по 4 байта, старший вперёд, хвост нулями) кадрами по 14,
+// [3] = слой<<4 | 14; у последнего кадра длина 0 и метка 5A A5 поверх первых двух байт (там нули: позиций всего 126)
+fn key_frames(layer: u8, keys: &[u32]) -> Vec<[u8; 20]> {
+    let mut data: Vec<u8> = keys.iter().flat_map(|v| v.to_be_bytes()).collect();
+    data.resize(37 * 14, 0);
+    (0..37).map(|i| {
+        let mut body = vec![0x01, 37, i as u8, layer << 4 | 14];
+        body.extend(&data[i * 14..i * 14 + 14]);
+        if i == 36 {
+            body[3] = layer << 4;
+            body[4] = 0x5A;
+            body[5] = 0xA5;
+        }
         frame(&body)
     }).collect()
 }
@@ -446,14 +491,22 @@ fn backup(name: &str, t: &[u8]) {
 }
 
 pub fn has_backup() -> bool {
-    backup_path("backup.bin").exists() || backup_path("backup-colors.bin").exists()
+    ["backup.bin", "backup-colors.bin", KEYS_BACKUP].iter().any(|n| backup_path(n).exists())
+}
+
+// Раскладка «как было» по слоям; None — клавиши ещё не трогали
+pub fn keys_backup() -> Option<Vec<Vec<u32>>> {
+    let b = std::fs::read(backup_path(KEYS_BACKUP)).ok().filter(|b| b.len() == 3 * KEYS * 4)?;
+    let all: Vec<u32> = b.chunks(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect();
+    Some(all.chunks(KEYS).map(<[u32]>::to_vec).collect())
 }
 
 // Палитры возвращаем, только если их меняли (есть копия)
 pub fn restore_backup(d: &Dev) -> bool {
     let colors = std::fs::read(backup_path("backup-colors.bin")).map_or(true, |p| d.write_palette(&p));
     let table = std::fs::read(backup_path("backup.bin")).map_or(true, |t| d.write_table(&t));
-    colors && table
+    let keys = keys_backup().map_or(true, |k| (0..3).all(|l| d.read_keys(l).as_ref() == Some(&k[l as usize]) || d.write_keys(l, &k[l as usize])));
+    colors && table && keys
 }
 
 // ───── свой цвет: оттенок и насыщенность ↔ RGB (яркость цвета — всегда полная, её задаёт яркость подсветки) ─────
@@ -557,6 +610,20 @@ mod tests {
     }
 
     #[test]
+    fn key_frames_match_driver() {
+        let mut keys = vec![0u32; KEYS];
+        keys[0] = 0x29;
+        keys[53] = 0x0D00_0000;
+        let f = key_frames(1, &keys);
+        assert_eq!(f.len(), 37);
+        assert_eq!(&f[0][..9], &[0x13, 0x01, 37, 0, 0x1E, 0, 0, 0, 0x29]);
+        assert_eq!(f[0][19], sum(&f[0][..19]));
+        assert_eq!(&f[15][1..5], &[0x01, 37, 15, 0x1E]); // байты 210..224 — позиция 53 начинается с 212
+        assert_eq!(&f[15][7..11], &[0x0D, 0, 0, 0]);
+        assert_eq!(&f[36][1..7], &[0x01, 37, 36, 0x10, 0x5A, 0xA5]);
+    }
+
+    #[test]
     fn color_round_trip() {
         assert_eq!(hsv(0.0, 1.0), (255, 0, 0));
         assert_eq!(hsv(1.0 / 3.0, 1.0), (0, 255, 0));
@@ -594,6 +661,42 @@ mod tests {
         });
         println!("{r:?}");
         assert!(r.is_some());
+    }
+
+    // Раскладка всех трёх слоёв, только чтение: cargo test keys_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn keys_live() {
+        with_dev(|d| {
+            for layer in 0..3u8 {
+                let k = d.read_multi_req(&[0x41, 0, 0, layer << 4]);
+                println!("слой {layer}: {:?}", k.as_ref().map(|k| k.len()));
+                if let Some(k) = k {
+                    let v: Vec<String> = k.chunks(4).enumerate().filter(|(_, c)| c.iter().any(|&b| b != 0))
+                        .map(|(i, c)| format!("{i}:{:08X}", u32::from_be_bytes([c[0], c[1], c[2], c[3]]))).collect();
+                    println!("{}", v.join(" "));
+                }
+            }
+            Some(())
+        });
+    }
+
+    // Запись раскладки на пустом третьем слое (на нём ничего не висит) и возврат: cargo test keys_write_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn keys_write_live() {
+        let ok = with_dev(|d| {
+            let orig = d.read_keys(2)?;
+            let mut k = orig.clone();
+            k[0] = 0x29;
+            let t = std::time::Instant::now();
+            let wrote = d.write_keys(2, &k);
+            println!("записал: {wrote} за {:?}, копия: {}", t.elapsed(), keys_backup().is_some());
+            let back = d.write_keys(2, &orig);
+            println!("вернул: {back}, сейчас как было: {}", d.read_keys(2).as_ref() == Some(&orig));
+            Some(wrote && back)
+        });
+        assert_eq!(ok, Some(true));
     }
 
     // Как быстро можно слать кадры: меняем невидимое (сон; палитру эффекта, который сейчас не горит), проверяем, возвращаем.
