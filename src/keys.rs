@@ -59,8 +59,7 @@ const KNOB: usize = 84;
 
 // Быстрый выбор того, что на клавиатуре не нажмёшь
 const PICKS: &[(&str, u32)] = &[
-    ("Пауза / пуск", 0x0200_00CD), ("Следующий", 0x0200_00B5), ("Предыдущий", 0x0200_00B6), ("Громче", 0x0200_00E9),
-    ("Тише", 0x0200_00EA), ("Без звука", 0x0200_00E2), ("Калькулятор", 0x0200_0192),
+    ("Пауза / пуск", 0x0200_00CD), ("Калькулятор", 0x0200_0192), // громкость и треки — на ручке и F7–F12
 ];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -546,7 +545,7 @@ impl Win {
                 x = chip(&d, x, FOOT + 30.0, name, Act::Pick(v), &mut hits);
             }
             let mut x = PAD;
-            x = chip(&d, x, FOOT + 70.0, "Ничего не делать", Act::Off, &mut hits);
+            x = chip(&d, x, FOOT + 70.0, "Отключить клавишу", Act::Off, &mut hits);
             if self.orig_of(self.layer, i).is_some_and(|o| Some(o) != keys.as_ref().map(|k| k[i])) {
                 x = chip(&d, x, FOOT + 70.0, "Как было", Act::Default, &mut hits);
             }
