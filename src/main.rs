@@ -1,20 +1,21 @@
-// Иконка в трее с зарядом беспроводной клавиатуры на донгле CompX (VID 3554, PID FA09).
-// Протокол: интерфейс FF02, output-репорт 20 байт `13 4A 00… сумма`, в ответ приходит
+// Иконка в трее с зарядом беспроводной клавиатуры на донгле CompX (VID 3554, PID FA09) и панель её настроек.
+// Протокол — в kb.rs: интерфейс FF02, output-репорт 20 байт `13 4A 00… сумма`, в ответ приходит
 // `13 4A 01 00 02 <%> <состояние> … сумма`, последний байт — сумма первых 19.
 // Чистый Win32 без рантаймов: скрытое окно + Shell_NotifyIcon, опрос раз в 30 с.
 #![windows_subsystem = "windows"]
 
-use std::{cell::RefCell, mem, ptr};
+mod kb;
+mod panel;
+
+use std::{cell::RefCell, mem, ptr, thread};
 use windows_sys::Win32::{
     Devices::DeviceAndDriverInstallation::*,
     Devices::HumanInterfaceDevice::*,
     Foundation::*,
     Graphics::Gdi::*,
-    Storage::FileSystem::*,
     System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW},
     System::Registry::*,
-    System::Threading::{CreateEventW, CreateMutexW, ResetEvent, WaitForSingleObject},
-    System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED},
+    System::Threading::CreateMutexW,
     Networking::WinInet::DeleteUrlCacheEntryW,
     Security::Cryptography::*,
     System::Com::Urlmon::URLDownloadToFileW,
@@ -23,10 +24,12 @@ use windows_sys::Win32::{
 };
 
 const WM_TRAY: u32 = WM_APP + 1;
+const WM_BATTERY: u32 = WM_APP + 2; // заряд прочитан в фоне: wparam = процент | зарядка << 8 | ответила << 9
 const ID_REFRESH: usize = 1;
 const ID_AUTORUN: usize = 2;
 const ID_EXIT: usize = 3;
 const ID_UPDATE: usize = 4;
+const ID_RESTORE: usize = 5;
 const REPO: &str = "STANFORDVIBE/kb-battery-tray";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -37,16 +40,15 @@ struct State {
     icon: HICON,
     tip: String,
     last_tip: Option<String>, // последний удачный ответ: спящая клавиатура заряд не отдаёт, держим старый
-    good_path: Option<Vec<u16>>, // интерфейс, который уже ответил, чтобы не перебирать каждый раз
     taskbar_msg: u32,
     mutex: HANDLE, // отпускаем перед перезапуском после обновления, иначе новая копия решит, что уже запущена
 }
 
 thread_local! {
-    static ST: RefCell<State> = RefCell::new(State {
+    static ST: RefCell<State> = const { RefCell::new(State {
         hwnd: ptr::null_mut(), icon: ptr::null_mut(), tip: String::new(),
-        last_tip: None, good_path: None, taskbar_msg: 0, mutex: ptr::null_mut(),
-    });
+        last_tip: None, taskbar_msg: 0, mutex: ptr::null_mut(),
+    }) };
 }
 
 fn w(s: &str) -> Vec<u16> {
@@ -72,9 +74,16 @@ fn main() {
         let tb = RegisterWindowMessageW(w("TaskbarCreated").as_ptr());
         ST.with(|s| { let mut s = s.borrow_mut(); s.hwnd = hwnd; s.taskbar_msg = tb; s.mutex = mutex; });
         remove_old_exe();
+        SetProcessDPIAware();
+        panel::init();
 
-        update();
+        ST.with(|s| {
+            let mut s = s.borrow_mut();
+            set_icon(&mut s, make_icon(0, false));
+            s.tip = "Клавиатура: ищу…".into();
+        });
         notify(NIM_ADD);
+        read_battery(hwnd);
         SetTimer(hwnd, 1, 30_000, None);
 
         let mut msg: MSG = mem::zeroed();
@@ -88,10 +97,11 @@ fn main() {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let tb = ST.with(|s| s.borrow().taskbar_msg);
     match msg {
-        WM_TIMER => { remove_old_exe(); update(); notify(NIM_MODIFY); }
+        WM_TIMER => { remove_old_exe(); read_battery(hwnd); }
+        WM_BATTERY => { update(((wp >> 9) & 1 != 0).then_some((wp as u8, (wp >> 8) & 1 != 0))); notify(NIM_MODIFY); }
         WM_TRAY => match lp as u32 {
-            WM_LBUTTONUP => { update(); notify(NIM_MODIFY); }
-            WM_RBUTTONUP => menu(hwnd),
+            WM_LBUTTONUP => panel::toggle(),
+            WM_RBUTTONUP => { panel::hide_now(); menu(hwnd) } // меню стопорит программу — анимация застыла бы на полпути
             _ => {}
         },
         m if m == tb && tb != 0 => notify(NIM_ADD),
@@ -104,6 +114,9 @@ unsafe fn menu(hwnd: HWND) {
     let m = CreatePopupMenu();
     let auto = if autorun_get() { MF_CHECKED } else { MF_UNCHECKED };
     AppendMenuW(m, MF_STRING, ID_REFRESH, w("Обновить").as_ptr());
+    if kb::has_backup() {
+        AppendMenuW(m, MF_STRING, ID_RESTORE, w("Вернуть настройки как до виджета…").as_ptr());
+    }
     AppendMenuW(m, MF_STRING | auto, ID_AUTORUN, w("Запускать с Windows").as_ptr());
     AppendMenuW(m, MF_STRING, ID_UPDATE, w(&format!("Проверить обновления (v{VERSION})")).as_ptr());
     AppendMenuW(m, MF_SEPARATOR, 0, ptr::null());
@@ -115,7 +128,13 @@ unsafe fn menu(hwnd: HWND) {
     PostMessageW(hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);
     match cmd as usize {
-        ID_REFRESH => { update(); notify(NIM_MODIFY); }
+        ID_REFRESH => read_battery(hwnd),
+        ID_RESTORE => {
+            let ask = "Вернуть подсветку и сон клавиатуры такими, какими они были до первой правки из панели?";
+            if message(hwnd, ask, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES {
+                panel::restore_backup();
+            }
+        }
         ID_AUTORUN => autorun_set(!autorun_get()),
         ID_UPDATE => check_update(hwnd),
         ID_EXIT => { notify(NIM_DELETE); PostQuitMessage(0); }
@@ -123,9 +142,8 @@ unsafe fn menu(hwnd: HWND) {
     }
 }
 
-// Читает заряд и готовит иконку/подсказку в State; показывает их notify().
-fn update() {
-    let r = read_battery();
+// Готовит иконку/подсказку по заряду в State; показывает их notify().
+fn update(r: Option<(u8, bool)>) {
     ST.with(|s| {
         let mut s = s.borrow_mut();
         match r {
@@ -179,21 +197,16 @@ fn notify(action: NOTIFY_ICON_MESSAGE) {
 
 // ---------- клавиатура ----------
 
-fn read_battery() -> Option<(u8, bool)> {
-    let cached = ST.with(|s| s.borrow().good_path.clone());
-    if let Some(p) = cached {
-        if let Some(r) = query(&p) {
-            return Some(r);
-        }
-    }
-    for p in hid_paths() {
-        if let Some(r) = query(&p) {
-            ST.with(|s| s.borrow_mut().good_path = Some(p));
-            return Some(r);
-        }
-    }
-    ST.with(|s| s.borrow_mut().good_path = None);
-    None
+// Заряд читаем в фоне: спящая клавиатура отвечает не сразу, а окно (и анимация панели) в это время должно жить
+fn read_battery(hwnd: HWND) {
+    let hwnd = hwnd as isize;
+    thread::spawn(move || {
+        // панель сейчас говорит с клавиатурой — не ждём её, иконка обновится в следующий раз
+        let Some(_l) = kb::try_lock() else { return };
+        let r = kb::with_dev(|d| d.battery());
+        let wp = r.map_or(0, |(pct, ch)| pct as usize | (ch as usize) << 8 | 1 << 9);
+        unsafe { PostMessageW(hwnd as HWND, WM_BATTERY, wp, 0) };
+    });
 }
 
 // Пути всех HID-интерфейсов донгла; нужный (FF02) отбирает query().
@@ -240,108 +253,6 @@ fn hid_paths() -> Vec<Vec<u16>> {
         SetupDiDestroyDeviceInfoList(set);
     }
     out
-}
-
-// Только служебный интерфейс 0xFF02 с репортами по 20 байт — в остальные (клавиши, мышь) не пишем.
-unsafe fn is_vendor_if(h: HANDLE) -> bool {
-    let mut pp = 0;
-    if HidD_GetPreparsedData(h, &mut pp) == 0 {
-        return false;
-    }
-    let mut caps: HIDP_CAPS = mem::zeroed();
-    let ok = HidP_GetCaps(pp, &mut caps) == HIDP_STATUS_SUCCESS
-        && caps.UsagePage == 0xFF02 && caps.InputReportByteLength == 20 && caps.OutputReportByteLength == 20;
-    HidD_FreePreparsedData(pp);
-    ok
-}
-
-fn query(path: &[u16]) -> Option<(u8, bool)> {
-    unsafe {
-        let h = CreateFileW(path.as_ptr(), 0xC000_0000, FILE_SHARE_READ | FILE_SHARE_WRITE,
-            ptr::null(), OPEN_EXISTING, FILE_FLAG_OVERLAPPED, ptr::null_mut());
-        if h == INVALID_HANDLE_VALUE {
-            return None;
-        }
-        let ev = CreateEventW(ptr::null(), 1, 0, ptr::null());
-        let result = if is_vendor_if(h) && !ev.is_null() { exchange(h, ev) } else { None };
-        if !ev.is_null() {
-            CloseHandle(ev);
-        }
-        CloseHandle(h);
-        result
-    }
-}
-
-// Шлёт запрос 0x4A и ждёт до ~2 с ответ с зарядом. Спящая клавиатура не отвечает — тогда None.
-unsafe fn exchange(h: HANDLE, ev: HANDLE) -> Option<(u8, bool)> {
-    let mut ov: OVERLAPPED = mem::zeroed();
-    ov.hEvent = ev;
-    let mut n = 0u32;
-    // ждёт завершения операции; по таймауту отменяет её, чтобы буфер не освободился под ней
-    let finish = |ov: &mut OVERLAPPED, n: &mut u32, ms: u32| -> bool {
-        if WaitForSingleObject(ev, ms) != WAIT_OBJECT_0 {
-            CancelIo(h);
-            GetOverlappedResult(h, ov, n, 1);
-            return false;
-        }
-        GetOverlappedResult(h, ov, n, 0) != 0
-    };
-
-    let req = frame(0x4A);
-    if WriteFile(h, req.as_ptr(), 20, ptr::null_mut(), &mut ov) == 0 && GetLastError() != ERROR_IO_PENDING {
-        return None;
-    }
-    if !finish(&mut ov, &mut n, 500) {
-        return None;
-    }
-    for _ in 0..8 {
-        // по пути могут влезть чужие кадры (эхо прошлых запросов) — пропускаем
-        let mut res = [0u8; 20];
-        ResetEvent(ev);
-        ov = mem::zeroed();
-        ov.hEvent = ev;
-        if ReadFile(h, res.as_mut_ptr(), 20, ptr::null_mut(), &mut ov) == 0 && GetLastError() != ERROR_IO_PENDING {
-            return None;
-        }
-        if !finish(&mut ov, &mut n, 2000) {
-            return None;
-        }
-        if let Some(r) = parse(&res) {
-            return Some(r);
-        }
-    }
-    None
-}
-
-fn frame(cmd: u8) -> [u8; 20] {
-    let mut f = [0u8; 20];
-    f[0] = 0x13;
-    f[1] = cmd;
-    f[19] = sum(&f[..19]);
-    f
-}
-
-fn sum(b: &[u8]) -> u8 {
-    b.iter().fold(0u8, |a, &x| a.wrapping_add(x))
-}
-
-// Ответ на 0x4A: [5] — %, [6] — состояние. Сам по себе раз в ~11 с ещё приходит 0x0A: [6] — %, [7] — состояние.
-// Возвращает (%, заряжается); % = 0 — процент не сообщили. Бит 0x10 состояния — провод воткнут
-// (на живой клавиатуре: 01 без провода, 10/11 с проводом).
-fn parse(res: &[u8; 20]) -> Option<(u8, bool)> {
-    if res[0] != 0x13 || res[19] != sum(&res[..19]) {
-        return None;
-    }
-    let (pct, state) = match res[1] {
-        0x4A => (res[5], res[6]),
-        0x0A => (res[6], res[7]),
-        _ => return None,
-    };
-    if state & 0x10 != 0 {
-        Some((pct.min(100), true))
-    } else {
-        (1..=100).contains(&pct).then_some((pct, false))
-    }
 }
 
 // ---------- иконка ----------
@@ -618,33 +529,6 @@ mod tests {
         assert!(!newer("v0.1.5", "0.2.0"));
     }
 
-    fn hex(s: &str) -> [u8; 20] {
-        let mut r = [0u8; 20];
-        for (d, b) in r.iter_mut().zip(s.split(' ')) {
-            *d = u8::from_str_radix(b, 16).unwrap();
-        }
-        r
-    }
-
-    #[test]
-    fn request_frame() {
-        assert_eq!(frame(0x4A), hex("13 4A 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 5D"));
-    }
-
-    #[test]
-    fn parses_real_replies() {
-        // сняты с живой клавиатуры
-        assert_eq!(parse(&hex("13 4A 01 00 02 64 01 00 00 00 00 00 00 00 00 00 00 00 00 C5")), Some((100, false)));
-        assert_eq!(parse(&hex("13 0A 01 00 04 05 64 01 00 00 00 00 00 00 00 00 00 00 00 8C")), Some((100, false)));
-        // на проводе
-        assert_eq!(parse(&hex("13 4A 01 00 02 64 11 00 00 00 00 00 00 00 00 00 00 00 00 D5")), Some((100, true)));
-        assert_eq!(parse(&hex("13 0A 01 00 04 05 64 10 00 00 00 00 00 00 00 00 00 00 00 9B")), Some((100, true)));
-        // эхо запроса — не заряд
-        assert_eq!(parse(&hex("13 05 01 00 0A 03 00 00 00 00 CD 01 00 00 00 00 00 00 00 F4")), None);
-        // битая сумма
-        assert_eq!(parse(&hex("13 0A 01 00 04 05 64 01 00 00 00 00 00 00 00 00 00 00 00 00")), None);
-    }
-
     // Превью всех состояний на тёмном фоне трея: cargo test preview -- --ignored, смотреть preview.bmp
     #[test]
     #[ignore]
@@ -686,15 +570,6 @@ mod tests {
             f.resize(f.len() + row - w * 3, 0);
         }
         std::fs::write("preview.bmp", f).unwrap();
-    }
-
-    // с живым донглом: cargo test -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn live_keyboard() {
-        let r = read_battery();
-        println!("заряд: {r:?}");
-        assert!(r.is_some());
     }
 
     #[test]

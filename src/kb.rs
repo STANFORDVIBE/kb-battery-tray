@@ -1,0 +1,504 @@
+// Клавиатура через донгл CompX: протокол веб-драйвера AULA (hub.aulacn.com, класс для 3554:FA09).
+// Кадр — output-репорт 20 байт на интерфейс FF02: [0]=0x13 (номер отчёта), [1]=команда, …, [19]=сумма первых 19.
+// Настройки живут в «таблице» ~140 байт: 0x44 — прочитать (ответ пачкой кадров: [2]=всего, [3]=номер, данные [5..19)),
+// 0x04 — записать целиком (кадры [1]=4, [2]=всего, [3]=номер, [4]=длина, 14 байт данных). Драйвер делает так же:
+// читает таблицу, правит пару байт, пишет обратно. 0x49 — палитры подсветки (по 7 цветов на эффект), их только читаем.
+// В таблице: [9..11) — эффект подсветки, [24] — сон; после пары FF FF (s) у каждого эффекта m по два байта:
+// s+2m-2 — яркость, s+2m-1 — скорость << 4 | цвет (0..6 — номер цвета палитры, 7 — радуга).
+use std::{mem, ptr, thread, time::Duration};
+use windows_sys::Win32::{
+    Devices::HumanInterfaceDevice::*,
+    Foundation::*,
+    Storage::FileSystem::*,
+    System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject},
+    System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED},
+};
+
+// Эффекты F75 в порядке драйвера; 0 — подсветка выключена, 277 — свой рисунок по клавишам (его панель не трогает)
+pub const MODES: &[(u16, &str)] = &[
+    (1, "Статика"), (2, "Дыхание"), (3, "Радуга"), (4, "Нажатие"), (5, "Дождь"), (7, "Круги"), (8, "Звёзды"),
+    (10, "Поток"), (11, "Дрейф"), (12, "Тень"), (13, "Волна"), (15, "Мельница"), (16, "Водопад"), (17, "Цветок"),
+];
+pub const NO_COLOR: &[u16] = &[3, 15, 16, 17]; // свои цвета у эффекта — драйвер прячет выбор цвета
+pub const NO_SPEED: &[u16] = &[1]; // статике скорость ни к чему
+const NO_SLOT: &[u16] = &[0, 19, 275, 277]; // у этих нет яркости/скорости в таблице
+pub const RAINBOW: u8 = 7;
+// shortcut: шкалы яркости и скорости подобраны по заводским значениям (яркость 9, скорость 3); драйвер пускает до 20 — расширить, если 9 окажется не максимумом
+pub const BRIGHT: &[u8] = &[1, 3, 5, 7, 9];
+pub const SPEED: &[u8] = &[0, 1, 2, 3, 4];
+// сон: код в таблице — как в драйвере (0 — никогда, 2 — 1 мин, 10 — 5 мин, 20 — 10 мин, 40 — 20 мин)
+pub const SLEEP: &[(u8, &str)] = &[(2, "1 мин"), (10, "5 мин"), (20, "10 мин"), (40, "20 мин"), (0, "Никогда")];
+// палитра по умолчанию — если цвета не прочитались
+pub const PALETTE: [(u8, u8, u8); 7] = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255), (255, 255, 255)];
+
+const PACE_MS: u64 = 20; // между кадрами записи: проверено на живой клавиатуре, вся таблица уходит за ~0,3 с
+
+// Один разговор с донглом за раз: заряд (иконка) и настройки (панель) иначе перепутают ответы
+static HID_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub fn lock() -> std::sync::MutexGuard<'static, ()> {
+    HID_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+pub fn try_lock() -> Option<std::sync::MutexGuard<'static, ()>> {
+    HID_LOCK.try_lock().ok()
+}
+
+// Интерфейс, на котором клавиатура ответила в прошлый раз, — его пробуем первым
+static DEV_PATH: std::sync::Mutex<Option<Vec<u16>>> = std::sync::Mutex::new(None);
+
+pub fn paths() -> Vec<Vec<u16>> {
+    let mut paths = crate::hid_paths();
+    if let Some(p) = DEV_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        paths.insert(0, p);
+    }
+    paths
+}
+
+pub fn remember(p: &[u16]) {
+    *DEV_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(p.to_vec());
+}
+
+// Первый удачный ответ клавиатуры с любого интерфейса донгла
+pub fn with_dev<R>(mut f: impl FnMut(&Dev) -> Option<R>) -> Option<R> {
+    paths().into_iter().find_map(|p| {
+        let r = f(&Dev::open(&p)?)?;
+        remember(&p);
+        Some(r)
+    })
+}
+
+// Таблица, снятая с живой F75 (статика, яркость 8, белый, сон 1 мин): для тестов и подставных данных панели
+pub const SAMPLE: [u8; 140] = [
+    0x00, 0x03, 0x03, 0x02, 0x00, 0x00, 0x04, 0x04, 0x07, 0x00, 0x01, 0x20, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x02, 0x01, 0x00, 0xFF, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x08, 0x36,
+    0x09, 0x37, 0x09, 0x37, 0x09, 0x37, 0x09, 0x27, 0x09, 0x37, 0x09, 0x37, 0x09, 0x37, 0x09, 0x37, 0x09, 0x36, 0x09, 0x34,
+    0x09, 0x37, 0x09, 0x37, 0x09, 0x37, 0x09, 0x37, 0x09, 0x37, 0x09, 0x37, 0x09, 0x37, 0x09, 0x37, 0x09, 0x37, 0x07, 0x47,
+    0x07, 0x47, 0x07, 0x44, 0x07, 0x44, 0x07, 0x44, 0x07, 0x44, 0x07, 0x44, 0x07, 0x44, 0x07, 0x44, 0x04, 0x09, 0x04, 0x04,
+    0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x5A, 0xA5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Config {
+    pub table: Vec<u8>,
+    pub palette: Vec<u8>, // 21 байт на эффект; пусто — не прочитали
+}
+
+impl Config {
+    pub fn mode(&self) -> u16 {
+        u16::from_be_bytes([self.table[9], self.table[10]])
+    }
+    pub fn sleep(&self) -> u8 {
+        self.table[24]
+    }
+    fn slot(&self, mode: u16) -> Option<usize> {
+        slot(&self.table, mode)
+    }
+    pub fn bright(&self) -> Option<u8> {
+        self.slot(self.mode()).map(|i| self.table[i])
+    }
+    pub fn speed(&self) -> Option<u8> {
+        self.slot(self.mode()).map(|i| self.table[i + 1] >> 4)
+    }
+    pub fn color(&self) -> Option<u8> {
+        self.slot(self.mode()).map(|i| self.table[i + 1] & 0x0F)
+    }
+    // Цвет n палитры текущего эффекта
+    pub fn swatch(&self, n: usize) -> (u8, u8, u8) {
+        let at = self.mode() as usize * 21 + n * 3;
+        match self.palette.get(at..at + 3) {
+            Some(c) => (c[0], c[1], c[2]),
+            None => PALETTE[n],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Change {
+    Mode(u16),
+    Bright(u8),
+    Speed(u8),
+    Color(u8),
+    Sleep(u8),
+}
+
+// Пара FF FF, за ней байты эффектов; None — эффект без настроек или таблица не та
+fn slot(t: &[u8], mode: u16) -> Option<usize> {
+    if NO_SLOT.contains(&mode) || mode == 0 {
+        return None;
+    }
+    let s = t.windows(2).position(|w| w == [0xFF, 0xFF])? + 2;
+    let i = s + mode as usize * 2 - 2;
+    (i + 1 < t.len()).then_some(i)
+}
+
+// Правка таблицы так же, как её делает драйвер; false — эту правку к таблице не применить
+pub fn apply(t: &mut [u8], c: Change) -> bool {
+    if t.len() < 100 {
+        return false;
+    }
+    let mode = u16::from_be_bytes([t[9], t[10]]);
+    match c {
+        Change::Mode(m) => {
+            [t[9], t[10]] = m.to_be_bytes();
+        }
+        Change::Sleep(v) => t[24] = v,
+        Change::Bright(v) => match slot(t, mode) {
+            Some(i) => t[i] = v.min(20),
+            None => return false,
+        },
+        Change::Speed(v) => match slot(t, mode) {
+            Some(i) => t[i + 1] = (v.min(15) << 4) | (t[i + 1] & 0x0F),
+            None => return false,
+        },
+        Change::Color(v) => match slot(t, mode) {
+            Some(i) => t[i + 1] = (t[i + 1] & 0xF0) | v.min(RAINBOW),
+            None => return false,
+        },
+    }
+    true
+}
+
+pub struct Dev {
+    h: HANDLE,
+    ev: HANDLE,
+}
+
+impl Drop for Dev {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.ev);
+            CloseHandle(self.h);
+        }
+    }
+}
+
+impl Dev {
+    // Только служебный интерфейс FF02 с репортами по 20 байт — в остальные (клавиши, мышь) не пишем
+    pub fn open(path: &[u16]) -> Option<Dev> {
+        unsafe {
+            let h = CreateFileW(path.as_ptr(), 0xC000_0000, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null(), OPEN_EXISTING, FILE_FLAG_OVERLAPPED, ptr::null_mut());
+            if h == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            let ev = CreateEventW(ptr::null(), 1, 0, ptr::null());
+            let d = Dev { h, ev };
+            // палитра приходит 35 кадрами разом, а Windows по умолчанию держит лишь 32 — хвост бы терялся
+            (!ev.is_null() && is_vendor_if(h) && HidD_SetNumInputBuffers(h, 128) != 0).then_some(d)
+        }
+    }
+
+    // Ждёт завершения операции; по таймауту отменяет её, чтобы буфер не освободился под ней
+    unsafe fn finish(&self, ov: &mut OVERLAPPED, ms: u32) -> bool {
+        let mut n = 0u32;
+        if WaitForSingleObject(self.ev, ms) != WAIT_OBJECT_0 {
+            CancelIo(self.h);
+            GetOverlappedResult(self.h, ov, &mut n, 1);
+            return false;
+        }
+        GetOverlappedResult(self.h, ov, &mut n, 0) != 0
+    }
+
+    fn write(&self, f: &[u8; 20]) -> bool {
+        unsafe {
+            ResetEvent(self.ev);
+            let mut ov: OVERLAPPED = mem::zeroed();
+            ov.hEvent = self.ev;
+            if WriteFile(self.h, f.as_ptr(), 20, ptr::null_mut(), &mut ov) == 0 && GetLastError() != ERROR_IO_PENDING {
+                return false;
+            }
+            self.finish(&mut ov, 500)
+        }
+    }
+
+    // Следующий целый кадр (с верной суммой); None — тишина ms миллисекунд
+    fn read(&self, ms: u32) -> Option<[u8; 20]> {
+        unsafe {
+            for _ in 0..16 {
+                let mut res = [0u8; 20];
+                ResetEvent(self.ev);
+                let mut ov: OVERLAPPED = mem::zeroed();
+                ov.hEvent = self.ev;
+                if ReadFile(self.h, res.as_mut_ptr(), 20, ptr::null_mut(), &mut ov) == 0 && GetLastError() != ERROR_IO_PENDING {
+                    return None;
+                }
+                if !self.finish(&mut ov, ms) {
+                    return None;
+                }
+                if res[0] == 0x13 && res[19] == sum(&res[..19]) {
+                    return Some(res);
+                }
+            }
+            None
+        }
+    }
+
+    // Запрос и ответ на него; по пути могут влезть чужие кадры (сам по себе раз в ~11 с приходит 0x0A) — пропускаем
+    fn ask(&self, cmd: u8, ms: u32) -> Option<[u8; 20]> {
+        unsafe { HidD_FlushQueue(self.h) };
+        if !self.write(&frame(&[cmd])) {
+            return None;
+        }
+        for _ in 0..8 {
+            let r = self.read(ms)?;
+            if r[1] == cmd {
+                return Some(r);
+            }
+        }
+        None
+    }
+
+    // (процент, заряжается); % = 0 — клавиатура процент не сообщила. Спящая не отвечает — тогда None
+    pub fn battery(&self) -> Option<(u8, bool)> {
+        unsafe { HidD_FlushQueue(self.h) };
+        if !self.write(&frame(&[0x4A])) {
+            return None;
+        }
+        for _ in 0..8 {
+            if let Some(r) = parse_battery(&self.read(2000)?) {
+                return Some(r);
+            }
+        }
+        None
+    }
+
+    // Код модели: F75 — 0x0300000000CD
+    #[cfg(test)]
+    pub fn model(&self) -> Option<u64> {
+        let r = self.ask(0x05, 1000)?;
+        Some(r[5..11].iter().fold(0u64, |a, &b| a << 8 | b as u64))
+    }
+
+    // Длинный ответ пачкой кадров; данные кадра — [5..19)
+    fn read_multi(&self, cmd: u8) -> Option<Vec<u8>> {
+        for _ in 0..3 {
+            let Some(first) = self.ask(cmd, 1000) else { continue };
+            let total = first[2] as usize;
+            if total == 0 {
+                continue;
+            }
+            let mut parts: Vec<Option<[u8; 20]>> = vec![None; total];
+            let mut next = Some(first);
+            while let Some(r) = next {
+                let i = r[3] as usize;
+                if r[1] == cmd && r[2] as usize == total && i < total {
+                    parts[i] = Some(r);
+                }
+                next = if parts.iter().all(Option::is_some) { None } else { self.read(1000) };
+            }
+            if parts.iter().all(Option::is_some) {
+                return Some(parts.into_iter().flatten().flat_map(|r| r[5..19].to_vec()).collect());
+            }
+        }
+        None
+    }
+
+    pub fn read_config(&self) -> Option<Config> {
+        let table = self.read_multi(0x44).filter(|t| t.len() >= 100)?;
+        let palette = self.read_multi(0x49).unwrap_or_default();
+        Some(Config { table, palette })
+    }
+
+    // Записать таблицу целиком и перечитать: true — клавиатура запомнила ровно это
+    pub fn write_table(&self, t: &[u8]) -> bool {
+        if t.len() < 100 || slot(t, 1).is_none() {
+            return false; // не наша таблица — мусор в клавиатуру не пишем
+        }
+        for f in table_frames(t) {
+            if !self.write(&f) {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(PACE_MS));
+        }
+        thread::sleep(Duration::from_millis(150));
+        self.read_multi(0x44).is_some_and(|back| back == t)
+    }
+
+    // Одна правка: свежая таблица из клавиатуры → правка → запись. Первая запись заодно сохраняет таблицу «как было»
+    pub fn change(&self, c: Change) -> bool {
+        let Some(mut t) = self.read_multi(0x44) else { return false };
+        backup(&t);
+        apply(&mut t, c) && self.write_table(&t)
+    }
+}
+
+// Кадры записи таблицы — байт в байт как у драйвера (у последнего кадра длина хвоста, у полного — 2)
+fn table_frames(t: &[u8]) -> Vec<[u8; 20]> {
+    let n = t.len().div_ceil(14);
+    (0..n).map(|i| {
+        let chunk = &t[i * 14..t.len().min(i * 14 + 14)];
+        let len = if i + 1 < n { 14 } else if chunk.len() == 14 { 2 } else { chunk.len() as u8 };
+        let mut body = vec![0x04, n as u8, i as u8, len];
+        body.extend(chunk);
+        body.resize(18, 0);
+        frame(&body)
+    }).collect()
+}
+
+pub fn frame(body: &[u8]) -> [u8; 20] {
+    let mut f = [0u8; 20];
+    f[0] = 0x13;
+    f[1..1 + body.len()].copy_from_slice(body);
+    f[19] = sum(&f[..19]);
+    f
+}
+
+fn sum(b: &[u8]) -> u8 {
+    b.iter().fold(0u8, |a, &x| a.wrapping_add(x))
+}
+
+// Ответ на 0x4A: [5] — %, [6] — состояние. Сам по себе раз в ~11 с ещё приходит 0x0A: [6] — %, [7] — состояние.
+// Бит 0x10 состояния — провод воткнут (на живой клавиатуре: 01 без провода, 10/11 с проводом).
+pub fn parse_battery(res: &[u8; 20]) -> Option<(u8, bool)> {
+    if res[0] != 0x13 || res[19] != sum(&res[..19]) {
+        return None;
+    }
+    let (pct, state) = match res[1] {
+        0x4A => (res[5], res[6]),
+        0x0A => (res[6], res[7]),
+        _ => return None,
+    };
+    if state & 0x10 != 0 {
+        Some((pct.min(100), true))
+    } else {
+        (1..=100).contains(&pct).then_some((pct, false))
+    }
+}
+
+unsafe fn is_vendor_if(h: HANDLE) -> bool {
+    let mut pp = 0;
+    if HidD_GetPreparsedData(h, &mut pp) == 0 {
+        return false;
+    }
+    let mut caps: HIDP_CAPS = mem::zeroed();
+    let ok = HidP_GetCaps(pp, &mut caps) == HIDP_STATUS_SUCCESS
+        && caps.UsagePage == 0xFF02 && caps.InputReportByteLength == 20 && caps.OutputReportByteLength == 20;
+    HidD_FreePreparsedData(pp);
+    ok
+}
+
+// ───── копия настроек «как было до виджета» ─────
+
+pub fn backup_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("KbBatteryTray").join("backup.bin")
+}
+
+// Только один раз — самая первая таблица, до любых правок панелью
+fn backup(t: &[u8]) {
+    let p = backup_path();
+    if p.exists() {
+        return;
+    }
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, t);
+}
+
+pub fn has_backup() -> bool {
+    backup_path().exists()
+}
+
+pub fn restore_backup(d: &Dev) -> bool {
+    std::fs::read(backup_path()).is_ok_and(|t| d.write_table(&t))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex(s: &str) -> Vec<u8> {
+        s.split(['-', ' ']).map(|b| u8::from_str_radix(b, 16).unwrap()).collect()
+    }
+
+    fn real_table() -> Vec<u8> {
+        SAMPLE.to_vec()
+    }
+
+    #[test]
+    fn reads_real_table() {
+        let c = Config { table: real_table(), palette: Vec::new() };
+        assert_eq!(c.table.len(), 140);
+        assert_eq!(c.mode(), 1);
+        assert_eq!((c.bright(), c.speed(), c.color()), (Some(8), Some(3), Some(6)));
+        assert_eq!(c.sleep(), 2);
+        assert_eq!(c.swatch(6), (255, 255, 255));
+    }
+
+    #[test]
+    fn changes_touch_only_their_bytes() {
+        let orig = real_table();
+        let diff = |c| {
+            let mut t = orig.clone();
+            assert!(apply(&mut t, c));
+            (0..t.len()).filter(|&i| t[i] != orig[i]).map(|i| (i, t[i])).collect::<Vec<_>>()
+        };
+        assert_eq!(diff(Change::Mode(5)), [(10, 5)]);
+        assert_eq!(diff(Change::Mode(0)), [(10, 0)]);
+        assert_eq!(diff(Change::Sleep(0)), [(24, 0)]);
+        assert_eq!(diff(Change::Bright(3)), [(58, 3)]); // эффект 1 → первые байты после FF FF (56, 57)
+        assert_eq!(diff(Change::Speed(1)), [(59, 0x16)]);
+        assert_eq!(diff(Change::Color(RAINBOW)), [(59, 0x37)]);
+        // у выключенной подсветки яркости нет — правка не применяется
+        let mut t = orig.clone();
+        apply(&mut t, Change::Mode(0));
+        assert!(!apply(&mut t, Change::Bright(5)));
+    }
+
+    #[test]
+    fn frames_match_driver() {
+        assert_eq!(frame(&[0x4A]).to_vec(), hex("13 4A 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 5D"));
+        assert_eq!(frame(&[0x05, 0x01]).to_vec(), hex("13 05 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 19"));
+        let t = real_table();
+        let f = table_frames(&t);
+        assert_eq!(f.len(), 10);
+        assert_eq!(f[0][..5], [0x13, 0x04, 10, 0, 14]);
+        assert_eq!(f[0][5..19], t[..14]);
+        assert_eq!(f[9][..5], [0x13, 0x04, 10, 9, 2]); // полный последний кадр — длина 2, как у драйвера
+        assert_eq!(f[9][5..19], t[126..140]);
+        assert!(f.iter().all(|x| x[19] == sum(&x[..19])));
+    }
+
+    #[test]
+    fn parses_real_battery_replies() {
+        let h = |s: &str| -> [u8; 20] { hex(s).try_into().unwrap() };
+        // сняты с живой клавиатуры
+        assert_eq!(parse_battery(&h("13 4A 01 00 02 64 01 00 00 00 00 00 00 00 00 00 00 00 00 C5")), Some((100, false)));
+        assert_eq!(parse_battery(&h("13 0A 01 00 04 05 64 01 00 00 00 00 00 00 00 00 00 00 00 8C")), Some((100, false)));
+        // на проводе
+        assert_eq!(parse_battery(&h("13 4A 01 00 02 64 11 00 00 00 00 00 00 00 00 00 00 00 00 D5")), Some((100, true)));
+        assert_eq!(parse_battery(&h("13 0A 01 00 04 05 64 10 00 00 00 00 00 00 00 00 00 00 00 9B")), Some((100, true)));
+        // эхо запроса модели — не заряд
+        assert_eq!(parse_battery(&h("13 05 01 00 0A 03 00 00 00 00 CD 01 00 00 00 00 00 00 00 F4")), None);
+        // битая сумма
+        assert_eq!(parse_battery(&h("13 0A 01 00 04 05 64 01 00 00 00 00 00 00 00 00 00 00 00 00")), None);
+    }
+
+    // Только чтение с живой клавиатуры: cargo test read_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn read_live() {
+        let r = with_dev(|d| {
+            let t = std::time::Instant::now();
+            Some((d.model(), d.battery(), d.read_config(), t.elapsed()))
+        });
+        println!("{r:?}");
+        assert!(r.is_some());
+    }
+
+    // Запись на живой клавиатуре и возврат как было: cargo test write_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn write_live() {
+        let ok = with_dev(|d| {
+            let orig = d.read_multi(0x44)?;
+            let t = std::time::Instant::now();
+            let changed = d.change(Change::Sleep(if orig[24] == 10 { 20 } else { 10 }));
+            println!("правка дошла: {changed} за {:?}", t.elapsed());
+            let restored = d.write_table(&orig);
+            println!("вернул как было: {restored}");
+            Some(changed && restored)
+        });
+        assert_eq!(ok, Some(true));
+    }
+}
