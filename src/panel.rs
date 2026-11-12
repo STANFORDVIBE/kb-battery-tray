@@ -66,6 +66,7 @@ enum Status {
     Loading,
     Ready,
     NoKb,
+    Foreign, // не F75 — только заряд
 }
 
 struct Panel {
@@ -154,6 +155,7 @@ struct Loaded {
     seq: u64,
     cfg: Option<Config>,
     battery: Option<(u8, bool)>,
+    foreign: bool, // клавиатура ответила, но это не F75
 }
 static RESULT: Mutex<Option<Loaded>> = Mutex::new(None);
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -189,7 +191,7 @@ fn worker(hwnd: isize, rx: mpsc::Receiver<(u64, Option<Job>)>) {
         let mut i = 0;
         jobs.retain(|j| { i += 1; !matches!(j, Job::Rgb(..)) || Some(i - 1) == last_rgb });
         let _l = kb::lock();
-        let mut out = Loaded { seq, cfg: None, battery: None };
+        let mut out = Loaded { seq, cfg: None, battery: None, foreign: false };
         if cfg!(debug_assertions) && std::env::var_os("KB_FAKE").is_some() {
             // только для скриншотов без клавиатуры: подставная таблица с живой F75
             let mut f = FAKE.lock().unwrap_or_else(|e| e.into_inner());
@@ -208,11 +210,23 @@ fn worker(hwnd: isize, rx: mpsc::Receiver<(u64, Option<Job>)>) {
                     Job::Restore => {}
                 }
             }
-            out.cfg = Some(Config { table: t.clone(), palette: pal.clone() });
             out.battery = Some((76, false));
+            if std::env::var_os("KB_FAKE").is_some_and(|v| v == "other") {
+                out.foreign = true; // KB_FAKE=other — как будто на донгле не F75
+            } else {
+                out.cfg = Some(Config { table: t.clone(), palette: pal.clone() });
+            }
         } else {
             let mut jobs = jobs.into_iter();
             kb::with_dev(|d| {
+                match d.model()? {
+                    kb::F75 => {}
+                    _ => {
+                        out.foreign = true; // не F75: настройки не пишем и не показываем, только заряд
+                        out.battery = d.battery();
+                        return Some(());
+                    }
+                }
                 for j in jobs.by_ref() {
                     match j {
                         Job::Change(c) => { d.change(c); }
@@ -590,7 +604,10 @@ impl Panel {
         if r.seq != SEQ.load(Ordering::SeqCst) {
             return; // пока читали, уже кликнули ещё — ждём свежий ответ
         }
-        self.status = if r.cfg.is_some() { Status::Ready } else { Status::NoKb };
+        self.status = if r.foreign { Status::Foreign } else if r.cfg.is_some() { Status::Ready } else { Status::NoKb };
+        if r.foreign {
+            self.confirmed = None;
+        }
         match r.cfg {
             Some(c) => {
                 if c.mode() != 0 {
@@ -746,21 +763,24 @@ impl Panel {
         }
 
         // шапка: название и заряд
-        d.text("AULA F75", 18.0, true, FG, rf(PAD, 16.0, 200.0, 26.0), Align::Left);
-        // значок клавиатуры: открывает окно с раскладкой
-        let kr = rf(PAD + 88.0, 15.0, 34.0, 28.0);
-        if self.hover == Some(Act::Keys) {
-            d.round(kr.X, kr.Y, kr.Width, kr.Height, 8.0, CARD_HOVER);
-        }
-        let (kx, ky) = (kr.X + 7.0, kr.Y + 7.0);
-        d.round_outline(kx, ky, 20.0, 14.0, 3.0, MUTED);
-        for (row, n) in [(0.0, 4), (4.0, 4)] {
-            for k in 0..n {
-                d.round(kx + 3.5 + k as f32 * 3.6, ky + 3.0 + row, 2.2, 2.2, 0.6, MUTED);
+        let name = if self.status == Status::Foreign { "Клавиатура" } else { "AULA F75" };
+        d.text(name, 18.0, true, FG, rf(PAD, 16.0, 200.0, 26.0), Align::Left);
+        // значок клавиатуры: открывает окно с раскладкой — только когда F75 ответила
+        if self.cfg.is_some() {
+            let kr = rf(PAD + 88.0, 15.0, 34.0, 28.0);
+            if self.hover == Some(Act::Keys) {
+                d.round(kr.X, kr.Y, kr.Width, kr.Height, 8.0, CARD_HOVER);
             }
+            let (kx, ky) = (kr.X + 7.0, kr.Y + 7.0);
+            d.round_outline(kx, ky, 20.0, 14.0, 3.0, MUTED);
+            for (row, n) in [(0.0, 4), (4.0, 4)] {
+                for k in 0..n {
+                    d.round(kx + 3.5 + k as f32 * 3.6, ky + 3.0 + row, 2.2, 2.2, 0.6, MUTED);
+                }
+            }
+            d.round(kx + 5.0, ky + 10.0, 10.0, 1.8, 0.9, MUTED);
+            hits.push((kr, Act::Keys));
         }
-        d.round(kx + 5.0, ky + 10.0, 10.0, 1.8, 0.9, MUTED);
-        hits.push((kr, Act::Keys));
         if let Some((pct, ch)) = self.battery {
             let x = W - PAD - 30.0;
             let fill = if ch { YELLOW } else if pct <= 20 { RED } else { GREEN };
@@ -780,6 +800,7 @@ impl Panel {
         let status = match self.status {
             Status::Loading if self.cfg.is_none() => "Читаю настройки клавиатуры…",
             Status::NoKb => "Клавиатура спит или донгл не вставлен — нажми любую клавишу",
+            Status::Foreign => "Это не AULA F75 — настройки не трогаю",
             _ => "",
         };
         // прогноз заряда; пока его нет — про донгл

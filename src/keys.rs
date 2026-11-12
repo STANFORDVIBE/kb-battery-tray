@@ -147,6 +147,9 @@ fn worker(rx: mpsc::Receiver<(u64, Job)>) {
             out.keys = Some(k.clone());
         } else {
             kb::with_dev(|d| {
+                if !d.is_f75() {
+                    return None; // раскладка нарисована под F75 — чужую модель не трогаем
+                }
                 out.ok = match &job {
                     Job::Load => true,
                     Job::Write(l, i, v) => d.set_key(*l, *i, *v),
