@@ -4,6 +4,7 @@
 // Чистый Win32 без рантаймов: скрытое окно + Shell_NotifyIcon, опрос раз в 30 с.
 #![windows_subsystem = "windows"]
 
+mod forecast;
 mod kb;
 mod panel;
 
@@ -155,7 +156,12 @@ fn update(r: Option<(u8, bool)>) {
                 s.last_tip = Some(tip);
             }
             Some((pct, charging)) => {
-                let tip = format!("Клавиатура: {pct}%{}", if charging { ", заряжается" } else { "" });
+                forecast::observe(pct, charging);
+                let mut tip = format!("Клавиатура: {pct}%{}", if charging { ", заряжается" } else { "" });
+                if let Some(f) = forecast::text() {
+                    tip = format!("{tip}
+{}", cap(&f));
+                }
                 set_icon(&mut s, make_icon(pct, charging));
                 s.tip = tip.clone();
                 s.last_tip = Some(tip);
@@ -169,6 +175,12 @@ fn update(r: Option<(u8, bool)>) {
             },
         }
     });
+}
+
+// Первая буква — заглавная: «Хватит примерно на 3 дня»
+pub fn cap(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
 }
 
 fn set_icon(s: &mut State, icon: HICON) {
@@ -203,7 +215,11 @@ fn read_battery(hwnd: HWND) {
     thread::spawn(move || {
         // панель сейчас говорит с клавиатурой — не ждём её, иконка обновится в следующий раз
         let Some(_l) = kb::try_lock() else { return };
-        let r = kb::with_dev(|d| d.battery());
+        let r = if cfg!(debug_assertions) && std::env::var_os("KB_FAKE").is_some() {
+            Some((76, false)) // скриншоты без клавиатуры
+        } else {
+            kb::with_dev(|d| d.battery())
+        };
         let wp = r.map_or(0, |(pct, ch)| pct as usize | (ch as usize) << 8 | 1 << 9);
         unsafe { PostMessageW(hwnd as HWND, WM_BATTERY, wp, 0) };
     });

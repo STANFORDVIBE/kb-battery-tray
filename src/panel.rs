@@ -745,9 +745,15 @@ impl Panel {
         let status = match self.status {
             Status::Loading if self.cfg.is_none() => "Читаю настройки клавиатуры…",
             Status::NoKb => "Клавиатура спит или донгл не вставлен — нажми любую клавишу",
-            _ => "Через донгл 2.4G · всё пишется прямо в клавиатуру",
+            _ => "",
         };
-        d.text(status, 12.0, false, MUTED, rf(PAD, 44.0, W - 2.0 * PAD, 18.0), Align::Left);
+        // прогноз заряда; пока его нет — про донгл
+        let status = match (status, crate::forecast::text()) {
+            ("", Some(f)) => crate::cap(&f),
+            ("", None) => "Прогноз заряда появится, когда батарея чуть сядет".to_string(),
+            (t, _) => t.to_string(),
+        };
+        d.text(&status, 12.0, false, MUTED, rf(PAD, 44.0, W - 2.0 * PAD, 18.0), Align::Left);
 
         let Some(c) = self.cfg.clone() else {
             self.hits = hits;
